@@ -189,14 +189,31 @@ func (c *Client) GetRandomTipAccountLocal() solana.PublicKey {
 	return GetRandomTipAccountLocal()
 }
 
+// SendResult contains the result of sending a transaction via Jito.
+type SendResult struct {
+	Signature solana.Signature
+	BundleID  string
+}
+
 // SendTransaction sends a single transaction via Jito Block Engine.
 // The transaction should be fully signed before calling this method.
 // Automatically retries on rate limiting with endpoint rotation.
+// Returns signature and bundle ID for confirmation.
 func (c *Client) SendTransaction(ctx context.Context, tx *solana.Transaction) (solana.Signature, error) {
+	result, err := c.SendTransactionWithBundleID(ctx, tx)
+	if err != nil {
+		return solana.Signature{}, err
+	}
+	return result.Signature, nil
+}
+
+// SendTransactionWithBundleID sends a transaction and returns both signature and bundle ID.
+// Use the bundle ID with WaitForBundleConfirmation for faster confirmation.
+func (c *Client) SendTransactionWithBundleID(ctx context.Context, tx *solana.Transaction) (SendResult, error) {
 	// Serialize transaction to base64
 	txBytes, err := tx.MarshalBinary()
 	if err != nil {
-		return solana.Signature{}, fmt.Errorf("marshal transaction: %w", err)
+		return SendResult{}, fmt.Errorf("marshal transaction: %w", err)
 	}
 	txBase64 := base64.StdEncoding.EncodeToString(txBytes)
 
@@ -212,22 +229,58 @@ func (c *Client) SendTransaction(ctx context.Context, tx *solana.Transaction) (s
 				time.Sleep(c.retryDelay)
 				continue
 			}
-			return solana.Signature{}, fmt.Errorf("jito send transaction: %w", err)
+			return SendResult{}, fmt.Errorf("jito send transaction: %w", err)
 		}
 
 		// Parse bundle ID response
 		var bundleID string
 		if err = json.Unmarshal(rawResp, &bundleID); err != nil {
-			return solana.Signature{}, fmt.Errorf("unmarshal bundle response: %w", err)
+			return SendResult{}, fmt.Errorf("unmarshal bundle response: %w", err)
 		}
 
 		// Return the first signature from the transaction
+		var sig solana.Signature
 		if len(tx.Signatures) > 0 {
-			return tx.Signatures[0], nil
+			sig = tx.Signatures[0]
 		}
-		return solana.Signature{}, nil
+		return SendResult{Signature: sig, BundleID: bundleID}, nil
 	}
-	return solana.Signature{}, fmt.Errorf("jito send transaction failed after %d retries: %w", c.maxRetries, lastErr)
+	return SendResult{}, fmt.Errorf("jito send transaction failed after %d retries: %w", c.maxRetries, lastErr)
+}
+
+// WaitForBundleConfirmation waits for a bundle to be confirmed via Jito.
+// This is faster than waiting for RPC confirmation as Jito knows immediately
+// when a bundle is landed.
+func (c *Client) WaitForBundleConfirmation(ctx context.Context, bundleID string) error {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			statuses, err := c.GetBundleStatuses(ctx, []string{bundleID})
+			if err != nil {
+				// Retry on error (might be rate limited)
+				continue
+			}
+			if statuses == nil || len(statuses.Value) == 0 {
+				continue
+			}
+			status := statuses.Value[0]
+			// Check confirmation status
+			switch status.ConfirmationStatus {
+			case "confirmed", "finalized":
+				return nil
+			}
+			// Check for errors
+			if status.Err.Ok == nil {
+				// Bundle failed
+				return fmt.Errorf("bundle failed: %v", status.Err)
+			}
+		}
+	}
 }
 
 // SendBundle sends multiple transactions as an atomic bundle via Jito Block Engine.

@@ -168,6 +168,22 @@ func (b *Builder) SendViaJito(ctx context.Context, tx *solana.Transaction) (sola
 	return sig, nil
 }
 
+// SendViaJitoAndConfirm sends via Jito and waits for bundle confirmation.
+func (b *Builder) SendViaJitoAndConfirm(ctx context.Context, tx *solana.Transaction) (solana.Signature, error) {
+	if b.jitoClient == nil {
+		return solana.Signature{}, fmt.Errorf("jito client is not configured")
+	}
+	result, err := b.jitoClient.SendTransactionWithBundleID(ctx, tx)
+	if err != nil {
+		return solana.Signature{}, fmt.Errorf("jito send transaction: %w", err)
+	}
+	// Wait for bundle confirmation via Jito
+	if err = b.jitoClient.WaitForBundleConfirmation(ctx, result.BundleID); err != nil {
+		return result.Signature, fmt.Errorf("jito confirmation failed: %w", err)
+	}
+	return result.Signature, nil
+}
+
 // SendBundleViaJito sends multiple transactions as an atomic bundle via Jito.
 // All transactions will either all succeed or all fail together.
 func (b *Builder) SendBundleViaJito(ctx context.Context, txs []*solana.Transaction) (string, error) {
@@ -198,8 +214,14 @@ func (b *Builder) BuildSignSend(ctx context.Context, feePayer wallet.Signer, sig
 }
 
 // SendAndConfirm sends a signed transaction and waits for confirmation.
+// If Jito is configured, uses Jito bundle confirmation for faster feedback.
 func (b *Builder) SendAndConfirm(ctx context.Context, tx *solana.Transaction, level ConfirmationLevel) (solana.Signature, error) {
-	sig, err := b.Send(ctx, tx)
+	// Use Jito if configured
+	if b.jitoClient != nil {
+		return b.SendViaJitoAndConfirm(ctx, tx)
+	}
+	// Standard RPC flow
+	sig, err := b.SendViaRPC(ctx, tx)
 	if err != nil {
 		return solana.Signature{}, err
 	}
