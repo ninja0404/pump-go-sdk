@@ -1,0 +1,39 @@
+# Build output
+bin/
+dist/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Keys and secrets (NEVER commit)
+id.json
+**/id.json
+*.key
+*.pem
+*.secret
+.env
+.env.*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+vendor/
+
+# Debug
+__debug_bin*
+
+# Example config (users should create their own)
+examples/**/config.json
