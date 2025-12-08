@@ -214,19 +214,17 @@ func (b *Builder) BuildSignSend(ctx context.Context, feePayer wallet.Signer, sig
 }
 
 // SendAndConfirm sends a signed transaction and waits for confirmation.
-// If Jito is configured, uses Jito bundle confirmation for faster feedback.
+// Uses Jito for sending if configured, but always uses standard RPC for confirmation
+// (Jito's GetBundleStatuses is unreliable).
 func (b *Builder) SendAndConfirm(ctx context.Context, tx *solana.Transaction, level ConfirmationLevel) (solana.Signature, error) {
-	// Use Jito if configured
-	if b.jitoClient != nil {
-		return b.SendViaJitoAndConfirm(ctx, tx)
-	}
-	// Standard RPC flow
-	sig, err := b.SendViaRPC(ctx, tx)
+	// Send via Jito or RPC
+	sig, err := b.Send(ctx, tx)
 	if err != nil {
 		return solana.Signature{}, err
 	}
+	// Always use standard RPC for confirmation (more reliable)
 	if err = b.WaitForConfirmation(ctx, sig, level); err != nil {
-		return sig, fmt.Errorf("confirmation failed: %w", err)
+		return sig, fmt.Errorf("confirmation failed: %w, sig: %v", err, sig)
 	}
 	return sig, nil
 }
@@ -253,7 +251,7 @@ func (b *Builder) WaitForConfirmation(ctx context.Context, sig solana.Signature,
 		return fmt.Errorf("rpc client is nil")
 	}
 
-	ticker := time.NewTicker(500 * time.Millisecond)
+	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
