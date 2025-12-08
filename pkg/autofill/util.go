@@ -2,6 +2,7 @@ package autofill
 
 import (
 	"context"
+	"encoding/binary"
 	"reflect"
 	"strings"
 
@@ -266,4 +267,73 @@ func buildCloseAccount(account, destination, owner, tokenProgram solana.PublicKe
 		solana.NewAccountMeta(owner, false, true),       // owner (signer)
 	}
 	return solana.NewInstruction(tokenProgram, metas, data)
+}
+
+// Compute Budget Program ID
+var computeBudgetProgramID = solana.MustPublicKeyFromBase58("ComputeBudget111111111111111111111111111111")
+
+// Default compute unit limit
+const defaultComputeLimit uint32 = 200000
+
+// buildComputeBudgetInstructions creates Compute Budget instructions based on options.
+// Returns instructions to prepend to the transaction (should be at the beginning).
+//
+// Supports two modes:
+// 1. Simple mode (PriorityFeeLamports): Set total fee, SDK calculates microLamports per CU
+// 2. Advanced mode (PriorityFeePerCU): Set microLamports per CU directly
+func buildComputeBudgetInstructions(options Options) []solana.Instruction {
+	var instrs []solana.Instruction
+
+	// Determine compute limit
+	computeLimit := options.ComputeLimit
+	if computeLimit == 0 {
+		computeLimit = defaultComputeLimit
+	}
+
+	// Calculate priority fee per CU
+	var pricePerCU uint64
+	if options.PriorityFeePerCU > 0 {
+		// Advanced mode: use directly
+		pricePerCU = options.PriorityFeePerCU
+	} else if options.PriorityFeeLamports > 0 {
+		// Simple mode: convert lamports to microLamports per CU
+		// Formula: microLamports_per_CU = (lamports * 1_000_000) / compute_units
+		pricePerCU = (options.PriorityFeeLamports * 1_000_000) / uint64(computeLimit)
+	}
+
+	// SetComputeUnitLimit instruction (discriminator = 2)
+	// Only add if explicitly set or if using simple mode (need to know CU for fee calculation)
+	if options.ComputeLimit > 0 || options.PriorityFeeLamports > 0 {
+		data := make([]byte, 5)
+		data[0] = 2 // discriminator
+		binary.LittleEndian.PutUint32(data[1:], computeLimit)
+		instrs = append(instrs, solana.NewInstruction(
+			computeBudgetProgramID,
+			nil, // no accounts
+			data,
+		))
+	}
+
+	// SetComputeUnitPrice instruction (discriminator = 3)
+	if pricePerCU > 0 {
+		data := make([]byte, 9)
+		data[0] = 3 // discriminator
+		binary.LittleEndian.PutUint64(data[1:], pricePerCU)
+		instrs = append(instrs, solana.NewInstruction(
+			computeBudgetProgramID,
+			nil, // no accounts
+			data,
+		))
+	}
+
+	return instrs
+}
+
+// prependComputeBudget adds Compute Budget instructions to the beginning of instruction list.
+func prependComputeBudget(instrs []solana.Instruction, options Options) []solana.Instruction {
+	cbInstrs := buildComputeBudgetInstructions(options)
+	if len(cbInstrs) == 0 {
+		return instrs
+	}
+	return append(cbInstrs, instrs...)
 }

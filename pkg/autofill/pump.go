@@ -86,8 +86,8 @@ func PumpBuy(ctx context.Context, rpc *sdkrpc.Client, user, mint solana.PublicKe
 		return pump.BuyAccounts{}, pump.BuyArgs{}, nil, err
 	}
 	instrs = append(instrs, ix)
-	// Append Jito tip if configured
-	instrs = appendJitoTipPump(instrs, user, options)
+	// Finalize: prepend Compute Budget, append Jito tip
+	instrs = finalizeInstructionsPump(instrs, user, options)
 	if options.Preview != nil {
 		_ = json.NewEncoder(options.Preview).Encode(struct {
 			Accounts pump.BuyAccounts `json:"accounts"`
@@ -180,8 +180,8 @@ func PumpBuyExactSolIn(ctx context.Context, rpc *sdkrpc.Client, user, mint solan
 		return pump.BuyExactSolInAccounts{}, pump.BuyExactSolInArgs{}, nil, err
 	}
 	instrs = append(instrs, ix)
-	// Append Jito tip if configured
-	instrs = appendJitoTipPump(instrs, user, options)
+	// Finalize: prepend Compute Budget, append Jito tip
+	instrs = finalizeInstructionsPump(instrs, user, options)
 	if options.Preview != nil {
 		_ = json.NewEncoder(options.Preview).Encode(struct {
 			Accounts pump.BuyExactSolInAccounts `json:"accounts"`
@@ -327,8 +327,8 @@ func PumpSellWithSlippage(ctx context.Context, rpc *sdkrpc.Client, user, mint so
 	if options.CloseBaseATA {
 		instrs = append(instrs, buildCloseAccount(accts.AssociatedUser, user, user, accts.TokenProgram))
 	}
-	// Append Jito tip if configured
-	instrs = appendJitoTipPump(instrs, user, options)
+	// Finalize: prepend Compute Budget, append Jito tip
+	instrs = finalizeInstructionsPump(instrs, user, options)
 
 	if options.Preview != nil {
 		_ = json.NewEncoder(options.Preview).Encode(struct {
@@ -357,7 +357,9 @@ func BuildAndSimulate(ctx context.Context, rpc *sdkrpc.Client, builder *txbuilde
 		return nil, err
 	}
 	return rpc.SimulateTransaction(ctx, tx, &solanarpc.SimulateTransactionOpts{
-		SigVerify: false,
+		SigVerify:              false,
+		ReplaceRecentBlockhash: true,
+		Commitment:             solanarpc.CommitmentProcessed,
 	})
 }
 
@@ -387,7 +389,9 @@ func simulateSolOut(ctx context.Context, rpc *sdkrpc.Client, user solana.PublicK
 		return 0, err
 	}
 	res, err := rpc.SimulateTransaction(ctx, tx, &solanarpc.SimulateTransactionOpts{
-		SigVerify: false,
+		SigVerify:              false,
+		ReplaceRecentBlockhash: true,
+		Commitment:             solanarpc.CommitmentProcessed,
 		Accounts: &solanarpc.SimulateTransactionAccountsOpts{
 			Encoding:  solana.EncodingBase64,
 			Addresses: []solana.PublicKey{user},
@@ -1003,15 +1007,22 @@ func pumpAutofillCreateV2(ctx context.Context, rpc *sdkrpc.Client, user, mint so
 	return accts, nil
 }
 
-// appendJitoTipPump appends a Jito tip transfer instruction if configured.
-func appendJitoTipPump(instrs []solana.Instruction, from solana.PublicKey, options *Options) []solana.Instruction {
-	if options == nil || options.JitoTipLamports == 0 {
+// finalizeInstructionsPump adds Compute Budget (prepend) and Jito tip (append) instructions.
+func finalizeInstructionsPump(instrs []solana.Instruction, from solana.PublicKey, options *Options) []solana.Instruction {
+	if options == nil {
 		return instrs
 	}
-	tipAccount := options.JitoTipAccount
-	if tipAccount.IsZero() {
-		tipAccount = jito.GetRandomTipAccountLocal()
+	// Prepend Compute Budget instructions (priority fee, compute limit)
+	instrs = prependComputeBudget(instrs, *options)
+
+	// Append Jito tip if configured
+	if options.JitoTipLamports > 0 {
+		tipAccount := options.JitoTipAccount
+		if tipAccount.IsZero() {
+			tipAccount = jito.GetRandomTipAccountLocal()
+		}
+		tipIx := system.NewTransferInstruction(options.JitoTipLamports, from, tipAccount).Build()
+		instrs = append(instrs, tipIx)
 	}
-	tipIx := system.NewTransferInstruction(options.JitoTipLamports, from, tipAccount).Build()
-	return append(instrs, tipIx)
+	return instrs
 }

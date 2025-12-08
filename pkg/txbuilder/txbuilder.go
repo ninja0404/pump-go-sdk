@@ -179,7 +179,7 @@ func (b *Builder) SendViaJitoAndConfirm(ctx context.Context, tx *solana.Transact
 	}
 	// Wait for bundle confirmation via Jito
 	if err = b.jitoClient.WaitForBundleConfirmation(ctx, result.BundleID); err != nil {
-		return result.Signature, fmt.Errorf("jito confirmation failed: %w", err)
+		return result.Signature, fmt.Errorf("jito confirmation failed: %w, signature: %v", err, result.Signature)
 	}
 	return result.Signature, nil
 }
@@ -241,7 +241,7 @@ func (b *Builder) BuildSignSendAndConfirm(ctx context.Context, feePayer wallet.S
 		return solana.Signature{}, err
 	}
 	allSigners := append([]wallet.Signer{feePayer}, signers...)
-	if err := SignTransaction(ctx, tx, allSigners...); err != nil {
+	if err = SignTransaction(ctx, tx, allSigners...); err != nil {
 		return solana.Signature{}, err
 	}
 	return b.SendAndConfirm(ctx, tx, level)

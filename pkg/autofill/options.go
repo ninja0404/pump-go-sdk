@@ -12,18 +12,21 @@ import (
 
 // Options configures autofill helpers.
 type Options struct {
-	Overrides        map[string]solana.PublicKey
-	Preview          io.Writer
-	TrackVolume      bool
-	VanitySuffix     string             // Vanity address suffix (e.g., "pump")
-	VanityPrefix     string             // Vanity address prefix
-	VanityTimeout    time.Duration      // Vanity search timeout (default: 5 minutes)
-	KnownATAs        []solana.PublicKey // Skip ATA existence check for these addresses
-	ExpectedQuoteOut uint64             // Skip simulation and use this as expected quote output (for sell)
-	CloseBaseATA     bool               // Close base token ATA after sell (default: false)
-	CloseQuoteATA    bool               // Close quote token ATA after sell for WSOL unwrap (default: false)
-	JitoTipLamports  uint64             // Jito tip amount in lamports (0 = no tip)
-	JitoTipAccount   solana.PublicKey   // Jito tip account (if zero, uses random from predefined list)
+	Overrides           map[string]solana.PublicKey
+	Preview             io.Writer
+	TrackVolume         bool
+	VanitySuffix        string             // Vanity address suffix (e.g., "pump")
+	VanityPrefix        string             // Vanity address prefix
+	VanityTimeout       time.Duration      // Vanity search timeout (default: 5 minutes)
+	KnownATAs           []solana.PublicKey // Skip ATA existence check for these addresses
+	ExpectedQuoteOut    uint64             // Skip simulation and use this as expected quote output (for sell)
+	CloseBaseATA        bool               // Close base token ATA after sell (default: false)
+	CloseQuoteATA       bool               // Close quote token ATA after sell for WSOL unwrap (default: false)
+	JitoTipLamports     uint64             // Jito tip amount in lamports (0 = no tip)
+	JitoTipAccount      solana.PublicKey   // Jito tip account (if zero, uses random from predefined list)
+	PriorityFeeLamports uint64             // Priority fee total in lamports (simple mode)
+	PriorityFeePerCU    uint64             // Priority fee in microLamports per Compute Unit (advanced mode)
+	ComputeLimit        uint32             // Compute unit limit (0 = use default 200000)
 }
 
 // Option functional option.
@@ -133,6 +136,49 @@ func WithJitoTip(tipLamports uint64) Option {
 //	)
 func WithJitoTipAccount(account solana.PublicKey) Option {
 	return func(o *Options) { o.JitoTipAccount = account }
+}
+
+// WithPriorityFee sets the total priority fee in lamports (simple mode).
+// SDK will auto-calculate microLamports per CU based on ComputeLimit.
+// This is the recommended way for most users.
+//
+// Example:
+//
+//	autofill.PumpAmmBuyWithSol(ctx, rpc, user, pool, amountSol, slippageBps,
+//	    autofill.WithPriorityFee(10000), // Total 10000 lamports = 0.00001 SOL
+//	)
+func WithPriorityFee(lamports uint64) Option {
+	return func(o *Options) { o.PriorityFeeLamports = lamports }
+}
+
+// WithPriorityFeePerCU sets the priority fee in microLamports per Compute Unit (advanced mode).
+// Use this for fine-grained control over priority fee.
+// Typical values: 1000-100000 microLamports (depends on network congestion).
+//
+// Note: 1 lamport = 1,000,000 microLamports
+//
+// Example:
+//
+//	autofill.PumpAmmBuyWithSol(ctx, rpc, user, pool, amountSol, slippageBps,
+//	    autofill.WithPriorityFeePerCU(10000), // 10000 microLamports per CU
+//	    autofill.WithComputeLimit(150000),    // Optional: set CU limit
+//	)
+func WithPriorityFeePerCU(microLamports uint64) Option {
+	return func(o *Options) { o.PriorityFeePerCU = microLamports }
+}
+
+// WithComputeLimit sets the compute unit limit for the transaction.
+// Default is 200000 CU if not set.
+// Setting a lower limit can reduce transaction cost when priority fee is used.
+//
+// Example:
+//
+//	autofill.PumpAmmBuyWithSol(ctx, rpc, user, pool, amountSol, slippageBps,
+//	    autofill.WithPriorityFee(10000),
+//	    autofill.WithComputeLimit(150000), // 150k CU limit
+//	)
+func WithComputeLimit(units uint32) Option {
+	return func(o *Options) { o.ComputeLimit = units }
 }
 
 // MergeOverridesFromJSON merges base58 pubkeys from JSON blob into map.

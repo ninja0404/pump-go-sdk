@@ -135,8 +135,8 @@ func PumpAmmBuyWithSol(
 	if exactAccts.BaseMint == constants.WSOLMint {
 		instrs = append(instrs, buildCloseAccount(exactAccts.UserBaseTokenAccount, exactAccts.User, exactAccts.User, exactAccts.BaseTokenProgram))
 	}
-	// Append Jito tip if configured
-	instrs = appendJitoTip(instrs, user, options)
+	// Finalize: prepend Compute Budget, append Jito tip
+	instrs = finalizeInstructions(instrs, user, options)
 	if options.Preview != nil {
 		_ = json.NewEncoder(options.Preview).Encode(struct {
 			Accounts      pumpamm.BuyExactQuoteInAccounts `json:"accounts"`
@@ -232,8 +232,8 @@ func PumpAmmBuyExactQuoteIn(
 	if exactAccts.BaseMint == constants.WSOLMint {
 		instrs = append(instrs, buildCloseAccount(exactAccts.UserBaseTokenAccount, exactAccts.User, exactAccts.User, exactAccts.BaseTokenProgram))
 	}
-	// Append Jito tip if configured
-	instrs = appendJitoTip(instrs, user, options)
+	// Finalize: prepend Compute Budget, append Jito tip
+	instrs = finalizeInstructions(instrs, user, options)
 
 	if options.Preview != nil {
 		_ = json.NewEncoder(options.Preview).Encode(struct {
@@ -349,8 +349,8 @@ func PumpAmmBuy(ctx context.Context, rpc *sdkrpc.Client, user, pool solana.Publi
 	if accts.QuoteMint == constants.WSOLMint {
 		instrs = append(instrs, buildCloseAccount(accts.UserQuoteTokenAccount, user, user, accts.QuoteTokenProgram))
 	}
-	// Append Jito tip if configured
-	instrs = appendJitoTip(instrs, user, options)
+	// Finalize: prepend Compute Budget, append Jito tip
+	instrs = finalizeInstructions(instrs, user, options)
 
 	if options.Preview != nil {
 		_ = json.NewEncoder(options.Preview).Encode(struct {
@@ -524,8 +524,8 @@ func PumpAmmSellWithSlippage(ctx context.Context, rpc *sdkrpc.Client, user, pool
 	if accts.QuoteMint == constants.WSOLMint {
 		instrs = append(instrs, buildCloseAccount(accts.UserQuoteTokenAccount, user, user, accts.QuoteTokenProgram))
 	}
-	// Append Jito tip if configured
-	instrs = appendJitoTip(instrs, user, options)
+	// Finalize: prepend Compute Budget, append Jito tip
+	instrs = finalizeInstructions(instrs, user, options)
 
 	if options.Preview != nil {
 		_ = json.NewEncoder(options.Preview).Encode(struct {
@@ -554,7 +554,9 @@ func BuildAndSimulateAmm(ctx context.Context, rpc *sdkrpc.Client, builder *txbui
 		return nil, err
 	}
 	return rpc.SimulateTransaction(ctx, tx, &solanarpc.SimulateTransactionOpts{
-		SigVerify: false,
+		SigVerify:              false,
+		ReplaceRecentBlockhash: true,
+		Commitment:             solanarpc.CommitmentProcessed,
 	})
 }
 
@@ -831,7 +833,9 @@ func simulateBaseOut(ctx context.Context, rpc *sdkrpc.Client, user, baseATA sola
 		return 0, fmt.Errorf("build tx for simulate: %w", err)
 	}
 	res, err := rpc.SimulateTransaction(ctx, tx, &solanarpc.SimulateTransactionOpts{
-		SigVerify: false,
+		SigVerify:              false,
+		ReplaceRecentBlockhash: true, // Use a valid recent blockhash for more accurate simulation
+		Commitment:             solanarpc.CommitmentProcessed,
 		Accounts: &solanarpc.SimulateTransactionAccountsOpts{
 			Encoding:  solana.EncodingBase64,
 			Addresses: []solana.PublicKey{baseATA},
@@ -861,7 +865,13 @@ func simulateBaseOut(ctx context.Context, rpc *sdkrpc.Client, user, baseATA sola
 	if acc.Amount < initialBase {
 		return 0, fmt.Errorf("simulate tx: base token decreased (%d -> %d)", initialBase, acc.Amount)
 	}
-	return acc.Amount - initialBase, nil
+	// Check if simulation result is zero (might indicate a problem)
+	baseOut := acc.Amount - initialBase
+	if baseOut == 0 {
+		// Return error with logs for debugging
+		return 0, fmt.Errorf("simulate tx: zero output (initial=%d, final=%d). This may indicate: 1) pool has no liquidity, 2) amount too small, 3) RPC issue. Logs: %v", initialBase, acc.Amount, res.Value.Logs)
+	}
+	return baseOut, nil
 }
 
 // simulateAmmQuoteOut 返回用户 quote ATA 增量（卖出 base -> quote）。
@@ -886,7 +896,9 @@ func simulateAmmQuoteOut(ctx context.Context, rpc *sdkrpc.Client, user solana.Pu
 		return 0, err
 	}
 	res, err := rpc.SimulateTransaction(ctx, tx, &solanarpc.SimulateTransactionOpts{
-		SigVerify: false,
+		SigVerify:              false,
+		ReplaceRecentBlockhash: true,
+		Commitment:             solanarpc.CommitmentProcessed,
 		Accounts: &solanarpc.SimulateTransactionAccountsOpts{
 			Encoding:  solana.EncodingBase64,
 			Addresses: []solana.PublicKey{accounts.UserQuoteTokenAccount},
@@ -928,7 +940,9 @@ func simulateQuoteConsumedNoSign(ctx context.Context, rpc *sdkrpc.Client, user, 
 	}
 	// No signing needed - use SigVerify: false
 	res, err := rpc.SimulateTransaction(ctx, tx, &solanarpc.SimulateTransactionOpts{
-		SigVerify: false, // Skip signature verification
+		SigVerify:              false, // Skip signature verification
+		ReplaceRecentBlockhash: true,
+		Commitment:             solanarpc.CommitmentProcessed,
 		Accounts: &solanarpc.SimulateTransactionAccountsOpts{
 			Encoding:  solana.EncodingBase64,
 			Addresses: []solana.PublicKey{quoteATA},
@@ -962,15 +976,18 @@ func simulateQuoteConsumedNoSign(ctx context.Context, rpc *sdkrpc.Client, user, 
 	return preBalance - acc.Amount, nil
 }
 
-// appendJitoTip appends a Jito tip transfer instruction if configured.
-func appendJitoTip(instrs []solana.Instruction, from solana.PublicKey, options *Options) []solana.Instruction {
-	if options == nil || options.JitoTipLamports == 0 {
+// finalizeInstructions adds Compute Budget (prepend) and Jito tip (append) instructions.
+func finalizeInstructions(instrs []solana.Instruction, from solana.PublicKey, options *Options) []solana.Instruction {
+	if options == nil {
 		return instrs
 	}
-	tipAccount := options.JitoTipAccount
-	if tipAccount.IsZero() {
-		return instrs // No tip account configured
+	// Prepend Compute Budget instructions (priority fee, compute limit)
+	instrs = prependComputeBudget(instrs, *options)
+
+	// Append Jito tip if configured
+	if options.JitoTipLamports > 0 && !options.JitoTipAccount.IsZero() {
+		tipIx := system.NewTransferInstruction(options.JitoTipLamports, from, options.JitoTipAccount).Build()
+		instrs = append(instrs, tipIx)
 	}
-	tipIx := system.NewTransferInstruction(options.JitoTipLamports, from, tipAccount).Build()
-	return append(instrs, tipIx)
+	return instrs
 }

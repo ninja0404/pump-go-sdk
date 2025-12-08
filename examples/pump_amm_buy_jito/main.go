@@ -28,6 +28,7 @@ func main() {
 		poolStr     = "DaMVs5xtRhipFWNyZFRDVw44xuLPRRCeakJABthJ5UAr" // 替换为实际池子
 		amountSol   = uint64(1_000_000)                              // 0.001 SOL
 		slippageBps = uint64(500)                                    // 5% 滑点
+		priorityFee = uint64(1_000_000)                              // 0.001 SOL Priority Fee
 		tipLamports = uint64(1_000_000)                              // 0.001 SOL tip to Jito
 		rpcURL      = solanarpc.MainNetBeta_RPC
 	)
@@ -46,8 +47,8 @@ func main() {
 	cfg.Timeout = 20 * time.Second
 	client := sdkrpc.NewClient(cfg)
 
-	// 初始化 Jito 客户端（使用多端点负载均衡，自动重试）
-	jitoClient := jito.NewClientWithEndpoints(jito.MainnetBlockEngines, "")
+	// 初始化 Jito 客户端
+	jitoClient := jito.NewClient("https://tokyo.mainnet.block-engine.jito.wtf/api/v1", "")
 
 	// 初始化 Builder 并配置 Jito
 	builder := txbuilder.NewBuilder(client, solanarpc.CommitmentConfirmed).
@@ -68,6 +69,7 @@ func main() {
 
 	// 构建买入指令，通过 WithJitoTip 选项自动添加 tip 转账
 	_, args, instrs, simBase, err := autofill.PumpAmmBuyWithSol(ctx, client, user, pool, amountSol, slippageBps,
+		autofill.WithPriorityFee(priorityFee),
 		autofill.WithJitoTip(tipLamports), // 自动添加 Jito tip 转账指令
 	)
 	if err != nil {
