@@ -23,18 +23,6 @@ func parsePubkey(label, v string) (solana.PublicKey, error) {
 	return pk, nil
 }
 
-func defaultSystemProgram() solana.PublicKey {
-	return solana.MustPublicKeyFromBase58("11111111111111111111111111111111")
-}
-
-func defaultTokenProgram() solana.PublicKey {
-	return solana.MustPublicKeyFromBase58("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
-}
-
-func defaultAssociatedTokenProgram() solana.PublicKey {
-	return solana.MustPublicKeyFromBase58("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
-}
-
 func isZeroPK(pk solana.PublicKey) bool {
 	return pk == (solana.PublicKey{})
 }
@@ -66,32 +54,20 @@ func loadPubkeyMap(path string) (map[string]string, error) {
 	return m, nil
 }
 
-// applyPubkeyOverrides sets exported fields on target struct if present in map.
-func applyPubkeyOverrides(target interface{}, m map[string]string) error {
-	if len(m) == 0 {
-		return nil
+func loadAutofillOverrides(path string) (map[string]solana.PublicKey, error) {
+	raw, err := loadPubkeyMap(path)
+	if err != nil {
+		return nil, err
 	}
-	val := reflectValue(target)
-	if !val.IsValid() || val.Kind() != reflect.Struct {
-		return fmt.Errorf("target must be struct")
-	}
-	t := val.Type()
-	for i := 0; i < val.NumField(); i++ {
-		field := t.Field(i)
-		if !field.IsExported() {
-			continue
-		}
-		key := pickKey(field.Name, m)
-		if key == "" {
-			continue
-		}
-		pk, err := parsePubkey(field.Name, m[key])
+	overrides := make(map[string]solana.PublicKey, len(raw))
+	for key, value := range raw {
+		publicKey, err := parsePubkey(key, value)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		val.Field(i).Set(reflect.ValueOf(pk))
+		overrides[key] = publicKey
 	}
-	return nil
+	return overrides, nil
 }
 
 // loadAccountsJSON fills a struct T from a JSON object of base58 pubkeys keyed by field name variants.

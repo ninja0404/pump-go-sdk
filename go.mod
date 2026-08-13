@@ -1,6 +1,8 @@
 module github.com/ninja0404/pump-go-sdk
 
-go 1.25.1
+go 1.25.12
+
+toolchain go1.26.5
 
 require (
 	github.com/gagliardetto/binary v0.8.0
@@ -12,7 +14,7 @@ require (
 )
 
 require (
-	filippo.io/edwards25519 v1.0.0-rc.1 // indirect
+	filippo.io/edwards25519 v1.1.1 // indirect
 	github.com/andres-erbsen/clock v0.0.0-20160526145045-9e14626cd129 // indirect
 	github.com/blendle/zapdriver v1.3.1 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect

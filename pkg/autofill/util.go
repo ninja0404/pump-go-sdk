@@ -32,7 +32,7 @@ func applyPubkeyOverrides(target interface{}, m map[string]solana.PublicKey) {
 	t := val.Type()
 	for i := 0; i < val.NumField(); i++ {
 		field := t.Field(i)
-		if !field.IsExported() {
+		if !field.IsExported() || field.Type != reflect.TypeOf(solana.PublicKey{}) {
 			continue
 		}
 		key := pickKey(field.Name, m)
@@ -77,19 +77,6 @@ func snake(name string) string {
 		parts = append(parts, strings.ToLower(cur))
 	}
 	return strings.Join(parts, "_")
-}
-
-func isZeroPK(pk solana.PublicKey) bool {
-	return pk == (solana.PublicKey{})
-}
-
-func firstNonZeroPK(list []solana.PublicKey) solana.PublicKey {
-	for _, pk := range list {
-		if !isZeroPK(pk) {
-			return pk
-		}
-	}
-	return solana.PublicKey{}
 }
 
 // ataRequest holds parameters for a single ATA ensure check.

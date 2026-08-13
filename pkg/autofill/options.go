@@ -15,6 +15,8 @@ type Options struct {
 	Overrides           map[string]solana.PublicKey
 	Preview             io.Writer
 	TrackVolume         bool
+	CashbackEnabled     bool
+	QuoteMint           solana.PublicKey
 	VanitySuffix        string             // Vanity address suffix (e.g., "pump")
 	VanityPrefix        string             // Vanity address prefix
 	VanityTimeout       time.Duration      // Vanity search timeout (default: 5 minutes)
@@ -42,6 +44,16 @@ func WithPreview(w io.Writer) Option {
 
 func WithTrackVolume(v bool) Option {
 	return func(o *Options) { o.TrackVolume = v }
+}
+
+// WithCashbackEnabled configures cashback for Pump create_v2.
+func WithCashbackEnabled(enabled bool) Option {
+	return func(o *Options) { o.CashbackEnabled = enabled }
+}
+
+// WithQuoteMint configures a non-native quote mint for Pump create_v2.
+func WithQuoteMint(mint solana.PublicKey) Option {
+	return func(o *Options) { o.QuoteMint = mint }
 }
 
 // WithVanitySuffix generates a mint address ending with the specified suffix.

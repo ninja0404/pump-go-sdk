@@ -11,11 +11,11 @@ import (
 	"github.com/ninja0404/pump-go-sdk/pkg/txbuilder"
 )
 
-func simulateInstruction(ctx context.Context, deps *runtimeDeps, ix solana.Instruction, commitment string) (*solanarpc.SimulateTransactionResponse, error) {
+func simulateInstruction(ctx context.Context, deps *runtimeDeps, commitment string, instructions ...solana.Instruction) (*solanarpc.SimulateTransactionResponse, error) {
 	if deps == nil || deps.builder == nil || deps.signer == nil || deps.rpc == nil {
 		return nil, fmt.Errorf("runtime deps not ready")
 	}
-	tx, err := deps.builder.BuildTransaction(ctx, deps.signer.PublicKey(), ix)
+	tx, err := deps.builder.BuildTransaction(ctx, deps.signer.PublicKey(), instructions...)
 	if err != nil {
 		return nil, fmt.Errorf("build tx: %w", err)
 	}

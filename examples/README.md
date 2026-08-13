@@ -80,7 +80,7 @@ slippageBps := uint64(100)           // 1% 滑点
 
 // 构建交易
 accts, args, instrs, simOut, err := autofill.PumpAmmBuyWithSol(
-    ctx, rpcClient, signer,
+    ctx, rpcClient, signer.PublicKey(),
     pool,
     quoteLamports,
     slippageBps,
@@ -114,7 +114,7 @@ slippageBps := uint64(100)    // 1% 滑点
 
 // 构建交易
 accts, args, instrs, err := autofill.PumpAmmSellWithSlippage(
-    ctx, rpcClient, signer,
+    ctx, rpcClient, signer.PublicKey(),
     pool,
     baseIn,
     slippageBps,
@@ -233,7 +233,7 @@ slippageBps := uint64(100)    // 1% 滑点
 
 // 构建交易（自动计算最小输出）
 accts, args, instrs, err := autofill.PumpSellWithSlippage(
-    ctx, rpcClient, signer,
+    ctx, rpcClient, signer.PublicKey(),
     mint, amount, slippageBps,
 )
 if err != nil {
@@ -349,4 +349,3 @@ pumpcli pump --help
 pumpcli pump create --help
 pumpcli pump-amm --help
 ```
-

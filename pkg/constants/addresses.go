@@ -31,6 +31,7 @@ var (
 const (
 	SeedGlobal                  = "global"
 	SeedBondingCurve            = "bonding-curve"
+	SeedBondingCurveV2          = "bonding-curve-v2"
 	SeedCreatorVault            = "creator-vault"
 	SeedMintAuthority           = "mint-authority"
 	SeedEventAuthority          = "__event_authority"
@@ -38,4 +39,6 @@ const (
 	SeedUserVolumeAccumulator   = "user_volume_accumulator"
 	SeedGlobalConfig            = "global_config"
 	SeedCreatorVaultAmm         = "creator_vault"
+	SeedPoolV2                  = "pool-v2"
+	SeedSharingConfig           = "sharing-config"
 )

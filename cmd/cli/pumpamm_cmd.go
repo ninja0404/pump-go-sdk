@@ -55,27 +55,27 @@ func newPumpAMMBuyCmd(opts *globalOpts) *cobra.Command {
 				return err
 			}
 
-			accounts, err := autofillPumpAMMBuy(ctx, deps, poolStr, userStr)
+			pool, err := parsePubkey("pool", poolStr)
 			if err != nil {
 				return err
 			}
+			user, err := parsePubkey("user", userStr)
+			if err != nil {
+				return err
+			}
+			options := []autofill.Option{autofill.WithTrackVolume(trackVolume)}
 			if overridePath != "" {
-				mp, err := loadPubkeyMap(overridePath)
+				overrides, err := loadAutofillOverrides(overridePath)
 				if err != nil {
 					return err
 				}
-				if err := applyPubkeyOverrides(&accounts, mp); err != nil {
-					return err
-				}
+				options = append(options, autofill.WithOverrides(overrides))
 			}
-			fillPumpAMMBuyDefaults(&accounts)
-
-			argsObj := pumpamm.BuyArgs{
-				BaseAmountOut:    baseOut,
-				MaxQuoteAmountIn: maxQuoteIn,
-				TrackVolume: pumpamm.OptionBool{
-					Field0: trackVolume,
-				},
+			accounts, _, instructions, err := autofill.PumpAmmBuy(
+				ctx, deps.rpc, user, pool, baseOut, maxQuoteIn, options...,
+			)
+			if err != nil {
+				return err
 			}
 
 			if preview {
@@ -84,12 +84,7 @@ func newPumpAMMBuyCmd(opts *globalOpts) *cobra.Command {
 				return nil
 			}
 
-			ix, err := pumpamm.BuildBuy(accounts, argsObj)
-			if err != nil {
-				return err
-			}
-
-			sig, err := deps.builder.BuildSignSend(ctx, deps.signer, nil, ix)
+			sig, err := deps.builder.BuildSignSend(ctx, deps.signer, nil, instructions...)
 			if err != nil {
 				return err
 			}
@@ -140,17 +135,9 @@ func newPumpAMMBuySolCmd(opts *globalOpts) *cobra.Command {
 			var options []autofill.Option
 			options = append(options, autofill.WithTrackVolume(trackVolume))
 			if overridePath != "" {
-				mp, err := loadPubkeyMap(overridePath)
+				overrides, err := loadAutofillOverrides(overridePath)
 				if err != nil {
 					return err
-				}
-				overrides := make(map[string]solana.PublicKey, len(mp))
-				for k, v := range mp {
-					pk, err := parsePubkey(k, v)
-					if err != nil {
-						return err
-					}
-					overrides[k] = pk
 				}
 				options = append(options, autofill.WithOverrides(overrides))
 			}
@@ -218,17 +205,9 @@ func newPumpAMMBuyExactQuoteCmd(opts *globalOpts) *cobra.Command {
 			var options []autofill.Option
 			options = append(options, autofill.WithTrackVolume(trackVolume))
 			if overridePath != "" {
-				mp, err := loadPubkeyMap(overridePath)
+				overrides, err := loadAutofillOverrides(overridePath)
 				if err != nil {
 					return err
-				}
-				overrides := make(map[string]solana.PublicKey, len(mp))
-				for k, v := range mp {
-					pk, err := parsePubkey(k, v)
-					if err != nil {
-						return err
-					}
-					overrides[k] = pk
 				}
 				options = append(options, autofill.WithOverrides(overrides))
 			}
@@ -289,24 +268,27 @@ func newPumpAMMSellCmd(opts *globalOpts) *cobra.Command {
 				return err
 			}
 
-			accounts, err := autofillPumpAMMSell(ctx, deps, poolStr, userStr)
+			pool, err := parsePubkey("pool", poolStr)
 			if err != nil {
 				return err
 			}
+			user, err := parsePubkey("user", userStr)
+			if err != nil {
+				return err
+			}
+			var options []autofill.Option
 			if overridePath != "" {
-				mp, err := loadPubkeyMap(overridePath)
+				overrides, err := loadAutofillOverrides(overridePath)
 				if err != nil {
 					return err
 				}
-				if err := applyPubkeyOverrides(&accounts, mp); err != nil {
-					return err
-				}
+				options = append(options, autofill.WithOverrides(overrides))
 			}
-			fillPumpAMMSellDefaults(&accounts)
-
-			argsObj := pumpamm.SellArgs{
-				BaseAmountIn:      baseIn,
-				MinQuoteAmountOut: minQuoteOut,
+			accounts, _, instruction, err := autofill.PumpAmmSell(
+				ctx, deps.rpc, user, pool, baseIn, minQuoteOut, options...,
+			)
+			if err != nil {
+				return err
 			}
 
 			if preview {
@@ -315,11 +297,7 @@ func newPumpAMMSellCmd(opts *globalOpts) *cobra.Command {
 				return nil
 			}
 
-			ix, err := pumpamm.BuildSell(accounts, argsObj)
-			if err != nil {
-				return err
-			}
-			sig, err := deps.builder.BuildSignSend(ctx, deps.signer, nil, ix)
+			sig, err := deps.builder.BuildSignSend(ctx, deps.signer, nil, instruction)
 			if err != nil {
 				return err
 			}
@@ -503,32 +481,29 @@ func newPumpAMMSimBuyCmd(opts *globalOpts) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			accounts, err := autofillPumpAMMBuy(ctx, deps, poolStr, userStr)
+			pool, err := parsePubkey("pool", poolStr)
 			if err != nil {
 				return err
 			}
+			user, err := parsePubkey("user", userStr)
+			if err != nil {
+				return err
+			}
+			options := []autofill.Option{autofill.WithTrackVolume(trackVolume)}
 			if overridePath != "" {
-				mp, err := loadPubkeyMap(overridePath)
+				overrides, err := loadAutofillOverrides(overridePath)
 				if err != nil {
 					return err
 				}
-				if err := applyPubkeyOverrides(&accounts, mp); err != nil {
-					return err
-				}
+				options = append(options, autofill.WithOverrides(overrides))
 			}
-			fillPumpAMMBuyDefaults(&accounts)
-			argsObj := pumpamm.BuyArgs{
-				BaseAmountOut:    baseOut,
-				MaxQuoteAmountIn: maxQuoteIn,
-				TrackVolume: pumpamm.OptionBool{
-					Field0: trackVolume,
-				},
-			}
-			ix, err := pumpamm.BuildBuy(accounts, argsObj)
+			_, _, instructions, err := autofill.PumpAmmBuy(
+				ctx, deps.rpc, user, pool, baseOut, maxQuoteIn, options...,
+			)
 			if err != nil {
 				return err
 			}
-			res, err := simulateInstruction(ctx, deps, ix, opts.commitment)
+			res, err := simulateInstruction(ctx, deps, opts.commitment, instructions...)
 			if err != nil {
 				return err
 			}
@@ -668,34 +643,6 @@ func fillPumpAMMEventAuthorityWithdraw(a *pumpamm.WithdrawAccounts) {
 	}
 	if isZeroPK(a.EventAuthority) {
 		if pk, _, err := pumpamm.DeriveWithdrawEventAuthorityPDA(*a, pumpamm.WithdrawArgs{}); err == nil {
-			a.EventAuthority = pk
-		}
-	}
-}
-
-func fillPumpAMMBuyDefaults(a *pumpamm.BuyAccounts) {
-	if a == nil {
-		return
-	}
-	if isZeroPK(a.EventAuthority) {
-		if pk, _, err := pumpamm.DeriveBuyEventAuthorityPDA(*a, pumpamm.BuyArgs{}); err == nil {
-			a.EventAuthority = pk
-		}
-	}
-	if isZeroPK(a.Program) {
-		a.Program = pumpamm.ProgramKey
-	}
-}
-
-func fillPumpAMMSellDefaults(a *pumpamm.SellAccounts) {
-	if a == nil {
-		return
-	}
-	if isZeroPK(a.Program) {
-		a.Program = pumpamm.ProgramKey
-	}
-	if isZeroPK(a.EventAuthority) {
-		if pk, _, err := pumpamm.DeriveSellEventAuthorityPDA(*a, pumpamm.SellArgs{}); err == nil {
 			a.EventAuthority = pk
 		}
 	}

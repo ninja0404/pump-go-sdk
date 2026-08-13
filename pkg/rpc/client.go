@@ -15,7 +15,7 @@ import (
 	"github.com/ninja0404/pump-go-sdk/pkg/config"
 )
 
-// Client wraps solana-go rpc.Client with retry, timeout, and rate limiting.
+// Client wraps solana-go rpc.Client with timeout, rate limiting, and retries for read operations.
 type Client struct {
 	raw     *solanarpc.Client
 	cfg     config.RPCConfig
@@ -66,10 +66,10 @@ func (c *Client) GetLatestBlockhash(ctx context.Context) (*solanarpc.GetLatestBl
 	return out, err
 }
 
-// SendTransaction submits a signed transaction.
+// SendTransaction submits a signed transaction exactly once.
 func (c *Client) SendTransaction(ctx context.Context, tx *solana.Transaction, opts solanarpc.TransactionOpts) (solana.Signature, error) {
 	var sig solana.Signature
-	err := c.call(ctx, "sendTransaction", func(ctx context.Context) error {
+	err := c.callOnce(ctx, func(ctx context.Context) error {
 		var err error
 		sig, err = c.raw.SendTransactionWithOpts(ctx, tx, opts)
 		return err
@@ -88,8 +88,22 @@ func (c *Client) SimulateTransaction(ctx context.Context, tx *solana.Transaction
 	return res, err
 }
 
+func (c *Client) callOnce(ctx context.Context, fn func(context.Context) error) error {
+	ctx, cancel := c.withTimeout(ctx)
+	defer cancel()
+
+	if c.limiter != nil {
+		if err := c.limiter.Wait(ctx); err != nil {
+			return err
+		}
+	}
+
+	return fn(ctx)
+}
+
 func (c *Client) call(ctx context.Context, op string, fn func(context.Context) error) error {
-	ctx = c.withTimeout(ctx)
+	ctx, cancel := c.withTimeout(ctx)
+	defer cancel()
 
 	if c.limiter != nil {
 		if err := c.limiter.Wait(ctx); err != nil {
@@ -133,12 +147,11 @@ func (c *Client) call(ctx context.Context, op string, fn func(context.Context) e
 	return fmt.Errorf("%s failed after %d attempts: %w", op, attempts, err)
 }
 
-func (c *Client) withTimeout(ctx context.Context) context.Context {
+func (c *Client) withTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
 	if c.cfg.Timeout <= 0 {
-		return ctx
+		return ctx, func() {}
 	}
-	ctxWithTimeout, _ := context.WithTimeout(ctx, c.cfg.Timeout)
-	return ctxWithTimeout
+	return context.WithTimeout(ctx, c.cfg.Timeout)
 }
 
 func (c *Client) backoff(attempt int) time.Duration {

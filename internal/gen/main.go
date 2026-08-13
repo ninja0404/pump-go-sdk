@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 )
 
 type idl struct {
@@ -38,6 +37,7 @@ type idlInstrAccount struct {
 	Name      string   `json:"name"`
 	Writable  bool     `json:"writable"`
 	Signer    bool     `json:"signer"`
+	Optional  bool     `json:"optional"`
 	PDA       *idlPDA  `json:"pda"`
 	Address   string   `json:"address"`
 	Relations []string `json:"relations"`
@@ -77,7 +77,13 @@ type idlTypeDef struct {
 }
 
 type idlTypeDesc struct {
-	Kind   string            `json:"kind"`
+	Kind     string            `json:"kind"`
+	Fields   []json.RawMessage `json:"fields"`
+	Variants []idlEnumVariant  `json:"variants"`
+}
+
+type idlEnumVariant struct {
+	Name   string            `json:"name"`
 	Fields []json.RawMessage `json:"fields"`
 }
 
@@ -159,12 +165,20 @@ func generateTypes(pkg string, doc idl) string {
 
 	imports := map[string]struct{}{}
 	for _, t := range doc.Types {
-		desc, _ := parseTypeDesc(t.Type)
-		if desc == nil || desc.Kind != "struct" {
-			continue
-		}
-		for _, f := range typeFields(desc) {
-			collectImports(parseType(f.Type), imports)
+		desc := mustParseTypeDesc(t.Name, t.Type)
+		switch desc.Kind {
+		case "struct":
+			for _, f := range typeFields(desc) {
+				collectImports(parseType(f.Type), imports)
+			}
+		case "enum":
+			for _, variant := range desc.Variants {
+				if len(variant.Fields) != 0 {
+					panic(fmt.Sprintf("enum %s variant %s has unsupported fields", t.Name, variant.Name))
+				}
+			}
+		default:
+			panic(fmt.Sprintf("type %s has unsupported kind %q", t.Name, desc.Kind))
 		}
 	}
 	if len(imports) > 0 {
@@ -179,20 +193,32 @@ func generateTypes(pkg string, doc idl) string {
 	}
 
 	for _, t := range doc.Types {
-		desc, _ := parseTypeDesc(t.Type)
-		if desc == nil || desc.Kind != "struct" {
-			continue
-		}
-		b.WriteString("type " + toExport(t.Name) + " struct {\n")
-		for _, f := range typeFields(desc) {
-			tr := parseType(f.Type)
-			tag := f.Name
-			if tr.Kind == "option" {
-				tag += " optional"
+		desc := mustParseTypeDesc(t.Name, t.Type)
+		switch desc.Kind {
+		case "struct":
+			b.WriteString("type " + toExport(t.Name) + " struct {\n")
+			for _, f := range typeFields(desc) {
+				tr := parseType(f.Type)
+				tag := f.Name
+				if tr.Kind == "option" {
+					tag += " optional"
+				}
+				b.WriteString("\t" + toExport(f.Name) + " " + goType(tr) + " `bin:\"" + tag + "\"`\n")
 			}
-			b.WriteString("\t" + toExport(f.Name) + " " + goType(tr) + " `bin:\"" + tag + "\"`\n")
+			b.WriteString("}\n\n")
+		case "enum":
+			name := toExport(t.Name)
+			b.WriteString("type " + name + " uint8\n\n")
+			b.WriteString("const (\n")
+			for i, variant := range desc.Variants {
+				b.WriteString("\t" + name + toExport(variant.Name))
+				if i == 0 {
+					b.WriteString(" " + name + " = iota")
+				}
+				b.WriteString("\n")
+			}
+			b.WriteString(")\n\n")
 		}
-		b.WriteString("}\n\n")
 	}
 	return b.String()
 }
@@ -212,9 +238,8 @@ func generateAccounts(pkg string, doc idl) string {
 		disc := bytesLiteral(acc.Discriminator)
 		b.WriteString("var " + toExport(acc.Name) + "Discriminator = " + disc + "\n\n")
 
-		// Ensure type exists
 		if !typeNames[acc.Name] {
-			b.WriteString("type " + toExport(acc.Name) + " struct{}\n\n")
+			panic(fmt.Sprintf("account %s has no matching type definition", acc.Name))
 		}
 
 		b.WriteString("func (a *" + toExport(acc.Name) + ") Unmarshal(data []byte) error {\n")
@@ -233,7 +258,7 @@ func generateInstructions(pkg string, doc idl) string {
 	var b strings.Builder
 	header(&b, pkg)
 
-	hasArgSeed := false
+	needsBinarySeedEncoding := false
 	for _, ins := range doc.Instructions {
 		for _, acc := range ins.Accounts {
 			if acc.PDA == nil {
@@ -241,8 +266,10 @@ func generateInstructions(pkg string, doc idl) string {
 			}
 			for _, seed := range acc.PDA.Seeds {
 				if seed.Kind == "arg" {
-					hasArgSeed = true
-					break
+					needsBinarySeedEncoding = needsBinarySeedEncoding || seedTypeNeedsBinary(instructionArgType(ins, pathHead(seed.Path)))
+				}
+				if seed.Kind == "account" && strings.Contains(seed.Path, ".") {
+					needsBinarySeedEncoding = needsBinarySeedEncoding || seedTypeNeedsBinary(nestedAccountFieldType(doc, seed.Path))
 				}
 			}
 		}
@@ -250,7 +277,7 @@ func generateInstructions(pkg string, doc idl) string {
 
 	b.WriteString("import (\n")
 	b.WriteString("\t\"bytes\"\n")
-	if hasArgSeed {
+	if needsBinarySeedEncoding {
 		b.WriteString("\t\"encoding/binary\"\n")
 	}
 	b.WriteString("\t\"fmt\"\n")
@@ -283,30 +310,36 @@ func generateInstructions(pkg string, doc idl) string {
 		for _, acc := range ins.Accounts {
 			b.WriteString("\t" + toExport(acc.Name) + " solana.PublicKey\n")
 		}
+		b.WriteString("\tRemainingAccounts []*solana.AccountMeta\n")
 		b.WriteString("}\n\n")
 
 		// AccountMeta builder
 		b.WriteString("func (a " + toExport(ins.Name) + "Accounts) ToAccountMetas() []*solana.AccountMeta {\n")
-		b.WriteString("\tmetas := make([]*solana.AccountMeta, 0, " + fmt.Sprint(len(ins.Accounts)) + ")\n")
+		b.WriteString("\tmetas := make([]*solana.AccountMeta, 0, " + fmt.Sprint(len(ins.Accounts)) + "+len(a.RemainingAccounts))\n")
 		for _, acc := range ins.Accounts {
 			pkExpr := "a." + toExport(acc.Name)
+			signer := acc.Signer
+			if acc.PDA != nil || acc.Address != "" {
+				signer = false
+			}
+			if acc.Optional {
+				b.WriteString("\tif " + pkExpr + ".IsZero() {\n")
+				b.WriteString("\t\tmetas = append(metas, solana.NewAccountMeta(ProgramKey, false, false))\n")
+				b.WriteString("\t} else {\n")
+				b.WriteString("\t\tmetas = append(metas, solana.NewAccountMeta(" + pkExpr + ", " + boolStr(acc.Writable) + ", " + boolStr(signer) + "))\n")
+				b.WriteString("\t}\n")
+				continue
+			}
 			if acc.Address != "" {
 				pkExpr = "default" + toExport(ins.Name) + toExport(acc.Name) + "()"
 				b.WriteString("var default" + toExport(ins.Name) + toExport(acc.Name) + " = func() solana.PublicKey {\n")
 				b.WriteString("\treturn solana.MustPublicKeyFromBase58(\"" + acc.Address + "\")\n")
 				b.WriteString("}\n\n")
 			}
-			signer := acc.Signer
-			// PDAs 或常量地址不应为 signer
-			if acc.PDA != nil {
-				signer = false
-			}
-			if acc.Address != "" {
-				signer = false
-			}
 			// solana.NewAccountMeta(pubkey, isWritable, isSigner)
 			b.WriteString("\tmetas = append(metas, solana.NewAccountMeta(" + pkExpr + ", " + boolStr(acc.Writable) + ", " + boolStr(signer) + "))\n")
 		}
+		b.WriteString("\tmetas = append(metas, a.RemainingAccounts...)\n")
 		b.WriteString("\treturn metas\n")
 		b.WriteString("}\n\n")
 
@@ -326,19 +359,29 @@ func generateInstructions(pkg string, doc idl) string {
 			if acc.PDA == nil || len(acc.PDA.Seeds) == 0 {
 				continue
 			}
-			b.WriteString("func Derive" + toExport(ins.Name) + toExport(acc.Name) + "PDA(accounts " + toExport(ins.Name) + "Accounts, args " + toExport(ins.Name) + "Args) (solana.PublicKey, uint8, error) {\n")
+			b.WriteString("func Derive" + toExport(ins.Name) + toExport(acc.Name) + "PDA(accounts " + toExport(ins.Name) + "Accounts, args " + toExport(ins.Name) + "Args")
+			nestedParams := nestedAccountSeedParams(doc, acc.PDA.Seeds)
+			for _, param := range nestedParams {
+				b.WriteString(", " + param.Name + " " + goType(param.Type))
+			}
+			b.WriteString(") (solana.PublicKey, uint8, error) {\n")
 			b.WriteString("\tseeds := make([][]byte, 0, " + fmt.Sprint(len(acc.PDA.Seeds)) + ")\n")
 			for _, seed := range acc.PDA.Seeds {
 				switch seed.Kind {
 				case "const":
 					b.WriteString("\tseeds = append(seeds, " + bytesLiteral(seed.Value) + ")\n")
 				case "account":
-					field := toExport(pathHead(seed.Path))
-					b.WriteString("\tseeds = append(seeds, accounts." + field + "[:])\n")
+					if strings.Contains(seed.Path, ".") {
+						param := nestedAccountSeedParamForPath(nestedParams, seed.Path)
+						b.WriteString(pdaTypedSeedCode(param.Name, param.Type))
+					} else {
+						field := toExport(pathHead(seed.Path))
+						b.WriteString("\tseeds = append(seeds, accounts." + field + "[:])\n")
+					}
 				case "arg":
 					argField := toExport(pathHead(seed.Path))
-					// assume number fits u64
-					b.WriteString("\t{\n\t\ttmp := make([]byte, 8)\n\t\tbinary.LittleEndian.PutUint64(tmp, uint64(args." + argField + "))\n\t\tseeds = append(seeds, tmp)\n\t}\n")
+					argType := instructionArgType(ins, pathHead(seed.Path))
+					b.WriteString(pdaArgSeedCode(argField, argType))
 				}
 			}
 			prog := "ProgramKey"
@@ -371,7 +414,7 @@ func generateErrors(pkg string, doc idl) string {
 
 func header(b *strings.Builder, pkg string) {
 	b.WriteString("// Code generated by internal/gen; DO NOT EDIT.\n")
-	b.WriteString("// Generated at " + time.Now().UTC().Format(time.RFC3339) + "\n\n")
+	b.WriteString("\n")
 	b.WriteString("package " + pkg + "\n\n")
 }
 
@@ -381,9 +424,20 @@ func parseTypeDesc(raw json.RawMessage) (*idlTypeDesc, error) {
 	}
 	var desc idlTypeDesc
 	if err := json.Unmarshal(raw, &desc); err != nil {
-		return nil, nil
+		return nil, err
 	}
 	return &desc, nil
+}
+
+func mustParseTypeDesc(name string, raw json.RawMessage) *idlTypeDesc {
+	desc, err := parseTypeDesc(raw)
+	if err != nil {
+		panic(fmt.Sprintf("parse type %s: %v", name, err))
+	}
+	if desc == nil {
+		panic(fmt.Sprintf("type %s has no descriptor", name))
+	}
+	return desc
 }
 
 func typeFields(desc *idlTypeDesc) []idlTypeField {
@@ -445,6 +499,8 @@ func goType(t typeRef) string {
 		return "bool"
 	case "string":
 		return "string"
+	case "bytes":
+		return "[]byte"
 	case "u8":
 		return "uint8"
 	case "u16":
@@ -455,6 +511,12 @@ func goType(t typeRef) string {
 		return "uint64"
 	case "u128":
 		return "bin.Uint128"
+	case "i8":
+		return "int8"
+	case "i16":
+		return "int16"
+	case "i128":
+		return "bin.Int128"
 	case "i64":
 		return "int64"
 	case "i32":
@@ -470,7 +532,7 @@ func goType(t typeRef) string {
 	case "defined":
 		return toExport(t.Defined)
 	default:
-		return "interface{}"
+		panic(fmt.Sprintf("unsupported IDL type %q", t.Kind))
 	}
 }
 
@@ -478,7 +540,7 @@ func collectImports(t typeRef, set map[string]struct{}) {
 	switch t.Kind {
 	case "pubkey":
 		set["solana"] = struct{}{}
-	case "u128":
+	case "u128", "i128":
 		set["bin"] = struct{}{}
 	case "option":
 		collectImports(*t.Elem, set)
@@ -490,6 +552,117 @@ func collectImports(t typeRef, set map[string]struct{}) {
 			set["bin"] = struct{}{}
 		}
 	}
+}
+
+func instructionArgType(ins idlInstruction, name string) typeRef {
+	for _, arg := range ins.Args {
+		if arg.Name == name {
+			return parseType(arg.Type)
+		}
+	}
+	panic(fmt.Sprintf("instruction %s PDA seed references unknown arg %s", ins.Name, name))
+}
+
+func pdaArgSeedCode(field string, typ typeRef) string {
+	return pdaTypedSeedCode("args."+field, typ)
+}
+
+func pdaTypedSeedCode(expression string, typ typeRef) string {
+	switch typ.Kind {
+	case "u8":
+		return "\tseeds = append(seeds, []byte{byte(" + expression + ")})\n"
+	case "u16", "i16":
+		return "\t{\n\t\ttmp := make([]byte, 2)\n\t\tbinary.LittleEndian.PutUint16(tmp, uint16(" + expression + "))\n\t\tseeds = append(seeds, tmp)\n\t}\n"
+	case "u32", "i32":
+		return "\t{\n\t\ttmp := make([]byte, 4)\n\t\tbinary.LittleEndian.PutUint32(tmp, uint32(" + expression + "))\n\t\tseeds = append(seeds, tmp)\n\t}\n"
+	case "u64", "i64":
+		return "\t{\n\t\ttmp := make([]byte, 8)\n\t\tbinary.LittleEndian.PutUint64(tmp, uint64(" + expression + "))\n\t\tseeds = append(seeds, tmp)\n\t}\n"
+	case "pubkey":
+		return "\tseeds = append(seeds, " + expression + "[:])\n"
+	case "string":
+		return "\tseeds = append(seeds, []byte(" + expression + "))\n"
+	case "bytes":
+		return "\tseeds = append(seeds, " + expression + ")\n"
+	default:
+		panic(fmt.Sprintf("PDA seed expression %s has unsupported type %q", expression, typ.Kind))
+	}
+}
+
+type nestedSeedParam struct {
+	Path string
+	Name string
+	Type typeRef
+}
+
+func nestedAccountSeedParams(doc idl, seeds []idlSeed) []nestedSeedParam {
+	params := make([]nestedSeedParam, 0)
+	seen := make(map[string]struct{})
+	for _, seed := range seeds {
+		if seed.Kind != "account" || !strings.Contains(seed.Path, ".") {
+			continue
+		}
+		if _, ok := seen[seed.Path]; ok {
+			continue
+		}
+		seen[seed.Path] = struct{}{}
+		parts := strings.Split(seed.Path, ".")
+		name := lowerFirst(toExport(strings.Join(parts, "_")))
+		params = append(params, nestedSeedParam{
+			Path: seed.Path,
+			Name: name,
+			Type: nestedAccountFieldType(doc, seed.Path),
+		})
+	}
+	return params
+}
+
+func nestedAccountSeedParamForPath(params []nestedSeedParam, path string) nestedSeedParam {
+	for _, param := range params {
+		if param.Path == path {
+			return param
+		}
+	}
+	panic(fmt.Sprintf("missing nested account seed parameter for %s", path))
+}
+
+func nestedAccountFieldType(doc idl, path string) typeRef {
+	parts := strings.Split(path, ".")
+	if len(parts) != 2 {
+		panic(fmt.Sprintf("unsupported nested account seed path %q", path))
+	}
+	typeName := toExport(parts[0])
+	for _, definition := range doc.Types {
+		if toExport(definition.Name) != typeName {
+			continue
+		}
+		desc := mustParseTypeDesc(definition.Name, definition.Type)
+		if desc.Kind != "struct" {
+			break
+		}
+		for _, field := range typeFields(desc) {
+			if field.Name == parts[1] {
+				return parseType(field.Type)
+			}
+		}
+		break
+	}
+	panic(fmt.Sprintf("cannot resolve nested account seed type for %s", path))
+}
+
+func seedTypeNeedsBinary(typ typeRef) bool {
+	switch typ.Kind {
+	case "u16", "i16", "u32", "i32", "u64", "i64":
+		return true
+	default:
+		return false
+	}
+}
+
+func lowerFirst(value string) string {
+	if value == "" {
+		return ""
+	}
+	return strings.ToLower(value[:1]) + value[1:]
 }
 
 func toExport(name string) string {

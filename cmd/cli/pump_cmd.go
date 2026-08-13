@@ -9,6 +9,7 @@ import (
 	"github.com/gagliardetto/solana-go"
 	"github.com/spf13/cobra"
 
+	"github.com/ninja0404/pump-go-sdk/pkg/autofill"
 	"github.com/ninja0404/pump-go-sdk/pkg/program/pump"
 	"github.com/ninja0404/pump-go-sdk/pkg/txbuilder"
 	"github.com/ninja0404/pump-go-sdk/pkg/wallet"
@@ -65,27 +66,27 @@ func newPumpBuyCmd(opts *globalOpts) *cobra.Command {
 				return err
 			}
 
-			accounts, err := autofillPumpBuy(ctx, deps, mintStr, userStr)
+			mint, err := parsePubkey("mint", mintStr)
 			if err != nil {
 				return err
 			}
+			user, err := parsePubkey("user", userStr)
+			if err != nil {
+				return err
+			}
+			options := []autofill.Option{autofill.WithTrackVolume(trackVolume)}
 			if overridePath != "" {
-				mp, err := loadPubkeyMap(overridePath)
+				overrides, err := loadAutofillOverrides(overridePath)
 				if err != nil {
 					return err
 				}
-				if err := applyPubkeyOverrides(&accounts, mp); err != nil {
-					return err
-				}
+				options = append(options, autofill.WithOverrides(overrides))
 			}
-			fillPumpBuyPDAs(&accounts)
-
-			argsObj := pump.BuyArgs{
-				Amount:     amount,
-				MaxSolCost: maxSolCost,
-				TrackVolume: pump.OptionBool{
-					Field0: trackVolume,
-				},
+			accounts, _, instructions, err := autofill.PumpBuy(
+				ctx, deps.rpc, user, mint, amount, maxSolCost, options...,
+			)
+			if err != nil {
+				return err
 			}
 
 			if preview {
@@ -94,12 +95,7 @@ func newPumpBuyCmd(opts *globalOpts) *cobra.Command {
 				return nil
 			}
 
-			ix, err := pump.BuildBuy(accounts, argsObj)
-			if err != nil {
-				return err
-			}
-
-			sig, err := deps.builder.BuildSignSend(ctx, deps.signer, nil, ix)
+			sig, err := deps.builder.BuildSignSend(ctx, deps.signer, nil, instructions...)
 			if err != nil {
 				return err
 			}
@@ -121,61 +117,6 @@ func newPumpBuyCmd(opts *globalOpts) *cobra.Command {
 	_ = cmd.MarkFlagRequired("max-sol-cost")
 
 	return cmd
-}
-
-func fillPumpBuyPDAs(a *pump.BuyAccounts) {
-	if a == nil {
-		return
-	}
-	if isZero(a.Program) {
-		a.Program = pump.ProgramKey
-	}
-	if isZero(a.SystemProgram) {
-		a.SystemProgram = defaultSystemProgram()
-	}
-	if isZero(a.TokenProgram) {
-		a.TokenProgram = defaultTokenProgram()
-	}
-	if isZero(a.Global) {
-		if pk, _, err := pump.DeriveBuyGlobalPDA(*a, pump.BuyArgs{}); err == nil {
-			a.Global = pk
-		}
-	}
-	if isZero(a.BondingCurve) {
-		if pk, _, err := pump.DeriveBuyBondingCurvePDA(*a, pump.BuyArgs{}); err == nil {
-			a.BondingCurve = pk
-		}
-	}
-	if isZero(a.AssociatedBondingCurve) {
-		if pk, _, err := pump.DeriveBuyAssociatedBondingCurvePDA(*a, pump.BuyArgs{}); err == nil {
-			a.AssociatedBondingCurve = pk
-		}
-	}
-	if isZero(a.CreatorVault) {
-		if pk, _, err := pump.DeriveBuyCreatorVaultPDA(*a, pump.BuyArgs{}); err == nil {
-			a.CreatorVault = pk
-		}
-	}
-	if isZero(a.EventAuthority) {
-		if pk, _, err := pump.DeriveBuyEventAuthorityPDA(*a, pump.BuyArgs{}); err == nil {
-			a.EventAuthority = pk
-		}
-	}
-	if isZero(a.GlobalVolumeAccumulator) {
-		if pk, _, err := pump.DeriveBuyGlobalVolumeAccumulatorPDA(*a, pump.BuyArgs{}); err == nil {
-			a.GlobalVolumeAccumulator = pk
-		}
-	}
-	if isZero(a.UserVolumeAccumulator) {
-		if pk, _, err := pump.DeriveBuyUserVolumeAccumulatorPDA(*a, pump.BuyArgs{}); err == nil {
-			a.UserVolumeAccumulator = pk
-		}
-	}
-	if isZero(a.FeeConfig) {
-		if pk, _, err := pump.DeriveBuyFeeConfigPDA(*a, pump.BuyArgs{}); err == nil {
-			a.FeeConfig = pk
-		}
-	}
 }
 
 func newPumpSellCmd(opts *globalOpts) *cobra.Command {
@@ -200,24 +141,27 @@ func newPumpSellCmd(opts *globalOpts) *cobra.Command {
 				return err
 			}
 
-			accounts, err := autofillPumpSell(ctx, deps, mintStr, userStr)
+			mint, err := parsePubkey("mint", mintStr)
 			if err != nil {
 				return err
 			}
+			user, err := parsePubkey("user", userStr)
+			if err != nil {
+				return err
+			}
+			var options []autofill.Option
 			if overridePath != "" {
-				mp, err := loadPubkeyMap(overridePath)
+				overrides, err := loadAutofillOverrides(overridePath)
 				if err != nil {
 					return err
 				}
-				if err := applyPubkeyOverrides(&accounts, mp); err != nil {
-					return err
-				}
+				options = append(options, autofill.WithOverrides(overrides))
 			}
-			fillPumpSellPDAs(&accounts)
-
-			argsObj := pump.SellArgs{
-				Amount:       amount,
-				MinSolOutput: minSolOutput,
+			accounts, _, instruction, err := autofill.PumpSell(
+				ctx, deps.rpc, user, mint, amount, minSolOutput, options...,
+			)
+			if err != nil {
+				return err
 			}
 
 			if preview {
@@ -226,12 +170,7 @@ func newPumpSellCmd(opts *globalOpts) *cobra.Command {
 				return nil
 			}
 
-			ix, err := pump.BuildSell(accounts, argsObj)
-			if err != nil {
-				return err
-			}
-
-			sig, err := deps.builder.BuildSignSend(ctx, deps.signer, nil, ix)
+			sig, err := deps.builder.BuildSignSend(ctx, deps.signer, nil, instruction)
 			if err != nil {
 				return err
 			}
@@ -252,51 +191,6 @@ func newPumpSellCmd(opts *globalOpts) *cobra.Command {
 	_ = cmd.MarkFlagRequired("min-sol-output")
 
 	return cmd
-}
-
-func fillPumpSellPDAs(a *pump.SellAccounts) {
-	if a == nil {
-		return
-	}
-	if isZero(a.Program) {
-		a.Program = pump.ProgramKey
-	}
-	if isZero(a.SystemProgram) {
-		a.SystemProgram = defaultSystemProgram()
-	}
-	if isZero(a.TokenProgram) {
-		a.TokenProgram = defaultTokenProgram()
-	}
-	if isZero(a.Global) {
-		if pk, _, err := pump.DeriveSellGlobalPDA(*a, pump.SellArgs{}); err == nil {
-			a.Global = pk
-		}
-	}
-	if isZero(a.BondingCurve) {
-		if pk, _, err := pump.DeriveSellBondingCurvePDA(*a, pump.SellArgs{}); err == nil {
-			a.BondingCurve = pk
-		}
-	}
-	if isZero(a.AssociatedBondingCurve) {
-		if pk, _, err := pump.DeriveSellAssociatedBondingCurvePDA(*a, pump.SellArgs{}); err == nil {
-			a.AssociatedBondingCurve = pk
-		}
-	}
-	if isZero(a.CreatorVault) {
-		if pk, _, err := pump.DeriveSellCreatorVaultPDA(*a, pump.SellArgs{}); err == nil {
-			a.CreatorVault = pk
-		}
-	}
-	if isZero(a.EventAuthority) {
-		if pk, _, err := pump.DeriveSellEventAuthorityPDA(*a, pump.SellArgs{}); err == nil {
-			a.EventAuthority = pk
-		}
-	}
-	if isZero(a.FeeConfig) {
-		if pk, _, err := pump.DeriveSellFeeConfigPDA(*a, pump.SellArgs{}); err == nil {
-			a.FeeConfig = pk
-		}
-	}
 }
 
 func newPumpCreateCmd(opts *globalOpts) *cobra.Command {
@@ -409,6 +303,8 @@ func newPumpCreateV2Cmd(opts *globalOpts) *cobra.Command {
 		uri           string
 		preview       bool
 		isMayhemMode  bool
+		cashback      bool
+		quoteMintStr  string
 		vanitySuffix  string
 		vanityPrefix  string
 		vanityTimeout int
@@ -448,11 +344,18 @@ Vanity Address:
 				return err
 			}
 			user := deps.signer.PublicKey()
+			var quoteMint solana.PublicKey
+			if quoteMintStr != "" {
+				quoteMint, err = parsePubkey("quote-mint", quoteMintStr)
+				if err != nil {
+					return err
+				}
+			}
 
 			startTime := time.Now()
 
 			accounts, argsObj, ix, mintKey, err := autofillPumpCreateV2(
-				ctx, deps, user, name, symbol, uri, isMayhemMode,
+				ctx, deps, user, name, symbol, uri, isMayhemMode, cashback, quoteMint,
 				vanitySuffix, vanityPrefix, time.Duration(vanityTimeout)*time.Second,
 			)
 			if err != nil {
@@ -497,6 +400,8 @@ Vanity Address:
 	cmd.Flags().StringVar(&uri, "uri", "", "metadata URI (e.g., 'https://example.com/metadata.json')")
 	cmd.Flags().BoolVar(&preview, "preview", false, "only print accounts without sending transaction")
 	cmd.Flags().BoolVar(&isMayhemMode, "mayhem", false, "enable mayhem mode")
+	cmd.Flags().BoolVar(&cashback, "cashback", false, "enable cashback")
+	cmd.Flags().StringVar(&quoteMintStr, "quote-mint", "", "optional non-native quote mint")
 	cmd.Flags().StringVar(&vanitySuffix, "suffix", "", "vanity address suffix (e.g., 'pump')")
 	cmd.Flags().StringVar(&vanityPrefix, "prefix", "", "vanity address prefix")
 	cmd.Flags().IntVar(&vanityTimeout, "vanity-timeout", 300, "vanity address search timeout in seconds")
@@ -605,31 +510,27 @@ func newPumpSimBuyCmd(opts *globalOpts) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			accounts, err := autofillPumpBuy(ctx, deps, mintStr, userStr)
+			mint, err := parsePubkey("mint", mintStr)
 			if err != nil {
 				return err
 			}
+			user, err := parsePubkey("user", userStr)
+			if err != nil {
+				return err
+			}
+			options := []autofill.Option{autofill.WithTrackVolume(trackVolume)}
 			if overridePath != "" {
-				mp, err := loadPubkeyMap(overridePath)
+				overrides, err := loadAutofillOverrides(overridePath)
 				if err != nil {
 					return err
 				}
-				if err := applyPubkeyOverrides(&accounts, mp); err != nil {
-					return err
-				}
+				options = append(options, autofill.WithOverrides(overrides))
 			}
-			argsObj := pump.BuyArgs{
-				Amount:     amount,
-				MaxSolCost: maxSolCost,
-				TrackVolume: pump.OptionBool{
-					Field0: trackVolume,
-				},
-			}
-			ix, err := pump.BuildBuy(accounts, argsObj)
+			_, _, instructions, err := autofill.PumpBuy(ctx, deps.rpc, user, mint, amount, maxSolCost, options...)
 			if err != nil {
 				return err
 			}
-			res, err := simulateInstruction(ctx, deps, ix, opts.commitment)
+			res, err := simulateInstruction(ctx, deps, opts.commitment, instructions...)
 			if err != nil {
 				return err
 			}
@@ -668,28 +569,27 @@ func newPumpSimSellCmd(opts *globalOpts) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			accounts, err := autofillPumpSell(ctx, deps, mintStr, userStr)
+			mint, err := parsePubkey("mint", mintStr)
 			if err != nil {
 				return err
 			}
+			user, err := parsePubkey("user", userStr)
+			if err != nil {
+				return err
+			}
+			var options []autofill.Option
 			if overridePath != "" {
-				mp, err := loadPubkeyMap(overridePath)
+				overrides, err := loadAutofillOverrides(overridePath)
 				if err != nil {
 					return err
 				}
-				if err := applyPubkeyOverrides(&accounts, mp); err != nil {
-					return err
-				}
+				options = append(options, autofill.WithOverrides(overrides))
 			}
-			argsObj := pump.SellArgs{
-				Amount:       amount,
-				MinSolOutput: minSolOutput,
-			}
-			ix, err := pump.BuildSell(accounts, argsObj)
+			_, _, instruction, err := autofill.PumpSell(ctx, deps.rpc, user, mint, amount, minSolOutput, options...)
 			if err != nil {
 				return err
 			}
-			res, err := simulateInstruction(ctx, deps, ix, opts.commitment)
+			res, err := simulateInstruction(ctx, deps, opts.commitment, instruction)
 			if err != nil {
 				return err
 			}

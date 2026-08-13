@@ -164,44 +164,48 @@ func AmmSellQuote(ctx context.Context, rpc *sdkrpc.Client, signer wallet.Signer,
 	}, nil
 }
 
-// PumpBuyQuote estimates the token output for a given SOL input on Pump bonding curve.
+// PumpBuyQuote estimates the token output for a given quote-token input on a Pump bonding curve.
 //
 // Parameters:
 //   - ctx: context for RPC calls
 //   - rpc: RPC client wrapper
 //   - mint: token mint address
-//   - solLamports: SOL amount to spend (lamports)
+//   - quoteAmount: quote-token amount to spend (lamports for native SOL, otherwise raw token units)
 //
 // Returns estimated token output amount.
-func PumpBuyQuote(ctx context.Context, rpc *sdkrpc.Client, mint solana.PublicKey, solLamports uint64) (uint64, error) {
+func PumpBuyQuote(ctx context.Context, rpc *sdkrpc.Client, mint solana.PublicKey, quoteAmount uint64) (uint64, error) {
 	if rpc == nil {
 		return 0, types.ErrNilRPC
 	}
-	if solLamports == 0 {
-		return 0, types.NewValidationError("solLamports", "must be greater than 0")
+	if quoteAmount == 0 {
+		return 0, types.NewValidationError("quoteAmount", "must be greater than 0")
 	}
 
-	// Fetch bonding curve state
-	bc, err := fetchBondingCurve(ctx, rpc, mint)
+	state, err := fetchPumpQuoteState(ctx, rpc, mint)
 	if err != nil {
 		return 0, err
 	}
-
-	// Calculate using bonding curve formula
-	// tokens_out = (sol_in * virtual_token_reserves) / (virtual_sol_reserves + sol_in)
-	solIn := new(big.Int).SetUint64(solLamports)
-	tokenReserves := new(big.Int).SetUint64(bc.VirtualTokenReserves)
-	solReserves := new(big.Int).SetUint64(bc.VirtualSolReserves)
-
-	numerator := new(big.Int).Mul(solIn, tokenReserves)
-	denominator := new(big.Int).Add(solReserves, solIn)
-
-	tokensOut := new(big.Int).Div(numerator, denominator)
-
-	return tokensOut.Uint64(), nil
+	protocolFeeBps, creatorFeeBps, err := state.feeBasisPoints(state.MintSupply)
+	if err != nil {
+		return 0, err
+	}
+	if state.BondingCurve.Creator.IsZero() {
+		creatorFeeBps = 0
+	}
+	totalFeeBps, err := addBasisPoints(protocolFeeBps, creatorFeeBps)
+	if err != nil {
+		return 0, err
+	}
+	return calculatePumpBuyAmount(
+		quoteAmount,
+		state.BondingCurve.VirtualTokenReserves,
+		state.BondingCurve.VirtualQuoteReserves,
+		state.BondingCurve.RealTokenReserves,
+		totalFeeBps,
+	), nil
 }
 
-// PumpSellQuote estimates the SOL output for a given token input on Pump bonding curve.
+// PumpSellQuote estimates the quote-token output for a given token input on a Pump bonding curve.
 //
 // Parameters:
 //   - ctx: context for RPC calls
@@ -209,7 +213,7 @@ func PumpBuyQuote(ctx context.Context, rpc *sdkrpc.Client, mint solana.PublicKey
 //   - mint: token mint address
 //   - tokenAmount: token amount to sell (base units)
 //
-// Returns estimated SOL output amount (lamports).
+// Returns raw quote-token output units (lamports for native SOL).
 func PumpSellQuote(ctx context.Context, rpc *sdkrpc.Client, mint solana.PublicKey, tokenAmount uint64) (uint64, error) {
 	if rpc == nil {
 		return 0, types.ErrNilRPC
@@ -218,24 +222,28 @@ func PumpSellQuote(ctx context.Context, rpc *sdkrpc.Client, mint solana.PublicKe
 		return 0, types.NewValidationError("tokenAmount", "must be greater than 0")
 	}
 
-	// Fetch bonding curve state
-	bc, err := fetchBondingCurve(ctx, rpc, mint)
+	state, err := fetchPumpQuoteState(ctx, rpc, mint)
 	if err != nil {
 		return 0, err
 	}
-
-	// Calculate using bonding curve formula
-	// sol_out = (token_in * virtual_sol_reserves) / (virtual_token_reserves + token_in)
-	tokenIn := new(big.Int).SetUint64(tokenAmount)
-	tokenReserves := new(big.Int).SetUint64(bc.VirtualTokenReserves)
-	solReserves := new(big.Int).SetUint64(bc.VirtualSolReserves)
-
-	numerator := new(big.Int).Mul(tokenIn, solReserves)
-	denominator := new(big.Int).Add(tokenReserves, tokenIn)
-
-	solOut := new(big.Int).Div(numerator, denominator)
-
-	return solOut.Uint64(), nil
+	mintSupply := uint64(1_000_000_000_000_000)
+	if state.BondingCurve.IsMayhemMode {
+		mintSupply = state.MintSupply
+	}
+	protocolFeeBps, creatorFeeBps, err := state.feeBasisPoints(mintSupply)
+	if err != nil {
+		return 0, err
+	}
+	if state.BondingCurve.Creator.IsZero() {
+		creatorFeeBps = 0
+	}
+	return calculatePumpSellAmount(
+		tokenAmount,
+		state.BondingCurve.VirtualTokenReserves,
+		state.BondingCurve.VirtualQuoteReserves,
+		protocolFeeBps,
+		creatorFeeBps,
+	)
 }
 
 // GetAmmPoolPrice returns the current spot price of an AMM pool.
@@ -265,7 +273,7 @@ func GetAmmPoolPrice(ctx context.Context, rpc *sdkrpc.Client, pool solana.Public
 
 // GetPumpPrice returns the current spot price of a Pump bonding curve.
 //
-// Returns price as SOL per token, scaled by 1e9.
+// Returns price as quote-token units per base-token unit, scaled by 1e9.
 func GetPumpPrice(ctx context.Context, rpc *sdkrpc.Client, mint solana.PublicKey) (uint64, error) {
 	if rpc == nil {
 		return 0, types.ErrNilRPC
@@ -280,8 +288,8 @@ func GetPumpPrice(ctx context.Context, rpc *sdkrpc.Client, mint solana.PublicKey
 		return 0, fmt.Errorf("bonding curve has zero token reserves")
 	}
 
-	// price = virtual_sol_reserves / virtual_token_reserves (scaled by 1e9)
-	price := new(big.Int).SetUint64(bc.VirtualSolReserves)
+	// price = virtual_quote_reserves / virtual_token_reserves (scaled by 1e9)
+	price := new(big.Int).SetUint64(bc.VirtualQuoteReserves)
 	price.Mul(price, big.NewInt(1e9))
 	price.Div(price, new(big.Int).SetUint64(bc.VirtualTokenReserves))
 
@@ -303,6 +311,9 @@ func fetchPoolState(ctx context.Context, rpc *sdkrpc.Client, pool solana.PublicK
 	if info == nil || info.Value == nil || info.Value.Data == nil {
 		return poolReserves{}, fmt.Errorf("pool account not found")
 	}
+	if info.Value.Owner != pumpamm.ProgramKey {
+		return poolReserves{}, fmt.Errorf("pool account has unexpected owner %s", info.Value.Owner)
+	}
 
 	var state pumpamm.Pool
 	if err := state.Unmarshal(info.Value.Data.GetBinary()); err != nil {
@@ -315,25 +326,145 @@ func fetchPoolState(ctx context.Context, rpc *sdkrpc.Client, pool solana.PublicK
 		return poolReserves{}, err
 	}
 
-	var baseReserves, quoteReserves uint64
-	if len(res.Value) >= 2 {
-		if res.Value[0] != nil && res.Value[0].Data != nil {
-			dec := bin.NewBinDecoder(res.Value[0].Data.GetBinary())
-			var acc token.Account
-			if err := dec.Decode(&acc); err == nil {
-				baseReserves = acc.Amount
-			}
-		}
-		if res.Value[1] != nil && res.Value[1].Data != nil {
-			dec := bin.NewBinDecoder(res.Value[1].Data.GetBinary())
-			var acc token.Account
-			if err := dec.Decode(&acc); err == nil {
-				quoteReserves = acc.Amount
-			}
-		}
+	if res == nil || len(res.Value) < 2 || res.Value[0] == nil || res.Value[0].Data == nil || res.Value[1] == nil || res.Value[1].Data == nil {
+		return poolReserves{}, fmt.Errorf("pool reserve token account not found")
+	}
+	if !isTokenProgram(res.Value[0].Owner) || !isTokenProgram(res.Value[1].Owner) {
+		return poolReserves{}, fmt.Errorf("pool reserve account has unsupported token program")
+	}
+	var baseAccount, quoteAccount token.Account
+	if err := bin.NewBinDecoder(res.Value[0].Data.GetBinary()).Decode(&baseAccount); err != nil {
+		return poolReserves{}, fmt.Errorf("decode base reserve account: %w", err)
+	}
+	if err := bin.NewBinDecoder(res.Value[1].Data.GetBinary()).Decode(&quoteAccount); err != nil {
+		return poolReserves{}, fmt.Errorf("decode quote reserve account: %w", err)
+	}
+	if baseAccount.Mint != state.BaseMint || quoteAccount.Mint != state.QuoteMint {
+		return poolReserves{}, fmt.Errorf("pool reserve token account mint mismatch")
 	}
 
-	return poolReserves{BaseReserves: baseReserves, QuoteReserves: quoteReserves}, nil
+	quoteReserves := new(big.Int).SetUint64(quoteAccount.Amount)
+	quoteReserves.Add(quoteReserves, state.VirtualQuoteReserves.BigInt())
+	if !quoteReserves.IsUint64() {
+		return poolReserves{}, fmt.Errorf("effective quote reserves are outside uint64 range")
+	}
+
+	return poolReserves{BaseReserves: baseAccount.Amount, QuoteReserves: quoteReserves.Uint64()}, nil
+}
+
+type pumpQuoteState struct {
+	BondingCurve pump.BondingCurve
+	Global       pump.Global
+	FeeConfig    *pump.FeeConfig
+	MintSupply   uint64
+}
+
+func fetchPumpQuoteState(ctx context.Context, rpc *sdkrpc.Client, mint solana.PublicKey) (pumpQuoteState, error) {
+	var state pumpQuoteState
+	bondingCurve, _, err := solana.FindProgramAddress(
+		[][]byte{[]byte(constants.SeedBondingCurve), mint[:]},
+		pump.ProgramKey,
+	)
+	if err != nil {
+		return state, fmt.Errorf("derive bonding curve: %w", err)
+	}
+	global, _, err := solana.FindProgramAddress([][]byte{[]byte(constants.SeedGlobal)}, pump.ProgramKey)
+	if err != nil {
+		return state, fmt.Errorf("derive global: %w", err)
+	}
+	feeConfig, _, err := solana.FindProgramAddress(
+		[][]byte{[]byte("fee_config"), pump.ProgramKey[:]},
+		constants.PumpFeeProgramID,
+	)
+	if err != nil {
+		return state, fmt.Errorf("derive fee config: %w", err)
+	}
+
+	accounts, err := rpc.Raw().GetMultipleAccounts(ctx, bondingCurve, global, feeConfig, mint)
+	if err != nil {
+		return state, fmt.Errorf("fetch pump quote state: %w", err)
+	}
+	if accounts == nil || len(accounts.Value) != 4 {
+		return state, fmt.Errorf("fetch pump quote state: expected 4 accounts")
+	}
+	if accounts.Value[0] == nil || accounts.Value[0].Data == nil {
+		return state, fmt.Errorf("bonding curve not found for mint %s", mint)
+	}
+	if accounts.Value[0].Owner != pump.ProgramKey {
+		return state, fmt.Errorf("bonding curve has unexpected owner %s", accounts.Value[0].Owner)
+	}
+	if err := state.BondingCurve.Unmarshal(accounts.Value[0].Data.GetBinary()); err != nil {
+		return state, fmt.Errorf("decode bonding curve: %w", err)
+	}
+	if accounts.Value[1] == nil || accounts.Value[1].Data == nil {
+		return state, fmt.Errorf("pump global account not found")
+	}
+	if accounts.Value[1].Owner != pump.ProgramKey {
+		return state, fmt.Errorf("pump global account has unexpected owner %s", accounts.Value[1].Owner)
+	}
+	if err := state.Global.Unmarshal(accounts.Value[1].Data.GetBinary()); err != nil {
+		return state, fmt.Errorf("decode pump global: %w", err)
+	}
+	if accounts.Value[2] != nil && accounts.Value[2].Data != nil {
+		if accounts.Value[2].Owner != constants.PumpFeeProgramID {
+			return state, fmt.Errorf("pump fee config has unexpected owner %s", accounts.Value[2].Owner)
+		}
+		state.FeeConfig = new(pump.FeeConfig)
+		if err := state.FeeConfig.Unmarshal(accounts.Value[2].Data.GetBinary()); err != nil {
+			return state, fmt.Errorf("decode pump fee config: %w", err)
+		}
+	}
+	if accounts.Value[3] == nil || accounts.Value[3].Data == nil {
+		return state, fmt.Errorf("mint account %s not found", mint)
+	}
+	if !isTokenProgram(accounts.Value[3].Owner) {
+		return state, fmt.Errorf("mint %s has unsupported token program %s", mint, accounts.Value[3].Owner)
+	}
+	var mintState token.Mint
+	if err := bin.NewBinDecoder(accounts.Value[3].Data.GetBinary()).Decode(&mintState); err != nil {
+		return state, fmt.Errorf("decode mint %s: %w", mint, err)
+	}
+	state.MintSupply = mintState.Supply
+	return state, nil
+}
+
+func (s pumpQuoteState) feeBasisPoints(mintSupply uint64) (uint64, uint64, error) {
+	if s.FeeConfig == nil {
+		return s.Global.FeeBasisPoints, s.Global.CreatorFeeBasisPoints, nil
+	}
+	if len(s.FeeConfig.FeeTiers) == 0 {
+		return 0, 0, fmt.Errorf("pump fee config has no fee tiers")
+	}
+	if s.BondingCurve.VirtualTokenReserves == 0 {
+		return 0, 0, nil
+	}
+
+	marketCap := new(big.Int).Mul(
+		new(big.Int).SetUint64(mintSupply),
+		new(big.Int).SetUint64(s.BondingCurve.VirtualQuoteReserves),
+	)
+	marketCap.Div(marketCap, new(big.Int).SetUint64(s.BondingCurve.VirtualTokenReserves))
+	selected := s.FeeConfig.FeeTiers[0].Fees
+	for i := len(s.FeeConfig.FeeTiers) - 1; i >= 0; i-- {
+		tier := s.FeeConfig.FeeTiers[i]
+		if marketCap.Cmp(tier.MarketCapLamportsThreshold.BigInt()) >= 0 {
+			selected = tier.Fees
+			break
+		}
+	}
+	return selected.ProtocolFeeBps, selected.CreatorFeeBps, nil
+}
+
+func addBasisPoints(a, b uint64) (uint64, error) {
+	result := new(big.Int).Add(new(big.Int).SetUint64(a), new(big.Int).SetUint64(b))
+	if !result.IsUint64() {
+		return 0, fmt.Errorf("fee basis points overflow")
+	}
+	return result.Uint64(), nil
+}
+
+func isTokenProgram(program solana.PublicKey) bool {
+	return program == constants.TokenProgramID || program == constants.Token2022ProgramID
 }
 
 func fetchBondingCurve(ctx context.Context, rpc *sdkrpc.Client, mint solana.PublicKey) (pump.BondingCurve, error) {
@@ -354,6 +485,9 @@ func fetchBondingCurve(ctx context.Context, rpc *sdkrpc.Client, mint solana.Publ
 	}
 	if info == nil || info.Value == nil || info.Value.Data == nil {
 		return bc, fmt.Errorf("bonding curve not found for mint %s", mint)
+	}
+	if info.Value.Owner != pump.ProgramKey {
+		return bc, fmt.Errorf("bonding curve has unexpected owner %s", info.Value.Owner)
 	}
 
 	if err := bc.Unmarshal(info.Value.Data.GetBinary()); err != nil {

@@ -3,8 +3,8 @@ package autofill
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"strings"
 
 	bin "github.com/gagliardetto/binary"
 	"github.com/gagliardetto/solana-go"
@@ -82,6 +82,10 @@ func PumpAmmBuyWithSol(
 	if err != nil {
 		return pumpamm.BuyExactQuoteInAccounts{}, pumpamm.BuyExactQuoteInArgs{}, nil, 0, err
 	}
+	if !isWSOL(buyAccts.QuoteMint, buyAccts.QuoteTokenProgram) {
+		return pumpamm.BuyExactQuoteInAccounts{}, pumpamm.BuyExactQuoteInArgs{}, nil, 0,
+			fmt.Errorf("pool quote mint %s is not native SOL; use PumpAmmBuyExactQuoteIn with raw quote units", buyAccts.QuoteMint)
+	}
 	exactAccts := toBuyExactAccounts(buyAccts)
 	applyOverrides(&exactAccts, options.Overrides)
 
@@ -135,6 +139,10 @@ func PumpAmmBuyWithSol(
 	if exactAccts.BaseMint == constants.WSOLMint {
 		instrs = append(instrs, buildCloseAccount(exactAccts.UserBaseTokenAccount, exactAccts.User, exactAccts.User, exactAccts.BaseTokenProgram))
 	}
+	// Unwrap any remaining WSOL after the buy.
+	if isWSOL(exactAccts.QuoteMint, exactAccts.QuoteTokenProgram) {
+		instrs = append(instrs, buildCloseAccount(exactAccts.UserQuoteTokenAccount, exactAccts.User, exactAccts.User, exactAccts.QuoteTokenProgram))
+	}
 	// Finalize: prepend Compute Budget, append Jito tip
 	instrs = finalizeInstructions(instrs, user, options)
 	if options.Preview != nil {
@@ -157,7 +165,7 @@ func PumpAmmBuyWithSol(
 //   - rpc: RPC client wrapper
 //   - user: buyer's public key
 //   - pool: AMM pool address
-//   - quoteLamports: exact SOL to spend (lamports)
+//   - quoteAmount: exact quote-token amount to spend (raw units)
 //   - minBaseOut: minimum tokens to receive (your slippage protection)
 //   - opts: optional configurations
 //
@@ -166,7 +174,7 @@ func PumpAmmBuyExactQuoteIn(
 	ctx context.Context,
 	rpc *sdkrpc.Client,
 	user, pool solana.PublicKey,
-	quoteLamports uint64,
+	quoteAmount uint64,
 	minBaseOut uint64,
 	opts ...Option,
 ) (pumpamm.BuyExactQuoteInAccounts, pumpamm.BuyExactQuoteInArgs, []solana.Instruction, error) {
@@ -180,8 +188,8 @@ func PumpAmmBuyExactQuoteIn(
 	if err := types.ValidatePublicKey("pool", pool); err != nil {
 		return pumpamm.BuyExactQuoteInAccounts{}, pumpamm.BuyExactQuoteInArgs{}, nil, err
 	}
-	if quoteLamports == 0 {
-		return pumpamm.BuyExactQuoteInAccounts{}, pumpamm.BuyExactQuoteInArgs{}, nil, types.NewValidationError("quoteLamports", "must be greater than 0")
+	if quoteAmount == 0 {
+		return pumpamm.BuyExactQuoteInAccounts{}, pumpamm.BuyExactQuoteInArgs{}, nil, types.NewValidationError("quoteAmount", "must be greater than 0")
 	}
 
 	options := &Options{TrackVolume: true}
@@ -210,16 +218,16 @@ func PumpAmmBuyExactQuoteIn(
 	instrs := ataResult.Instructions
 
 	// 自动 wrap SOL -> WSOL，仅补足差额（使用批量查询的余额）
-	if isWSOL(exactAccts.QuoteMint, exactAccts.QuoteTokenProgram) && quoteLamports > 0 {
+	if isWSOL(exactAccts.QuoteMint, exactAccts.QuoteTokenProgram) && quoteAmount > 0 {
 		existing := ataResult.Balances[exactAccts.UserQuoteTokenAccount.String()]
-		if quoteLamports > existing {
-			wrapLamports := quoteLamports - existing
+		if quoteAmount > existing {
+			wrapLamports := quoteAmount - existing
 			instrs = append(instrs, buildWrapWSOL(exactAccts.User, exactAccts.UserQuoteTokenAccount, wrapLamports)...)
 		}
 	}
 
 	args := pumpamm.BuyExactQuoteInArgs{
-		SpendableQuoteIn: quoteLamports,
+		SpendableQuoteIn: quoteAmount,
 		MinBaseAmountOut: minBaseOut,
 		TrackVolume:      pumpamm.OptionBool{Field0: options.TrackVolume},
 	}
@@ -317,7 +325,10 @@ func PumpAmmBuy(ctx context.Context, rpc *sdkrpc.Client, user, pool solana.Publi
 		}
 		simInstrs = append(simInstrs, simIx)
 
-		preBalance := existingQuote + (maxQuoteIn - existingQuote)
+		preBalance := existingQuote
+		if maxQuoteIn > preBalance {
+			preBalance = maxQuoteIn
+		}
 		quoteConsumed, err := simulateQuoteConsumedNoSign(ctx, rpc, user, accts.UserQuoteTokenAccount, preBalance, simInstrs...)
 		if err != nil {
 			return pumpamm.BuyAccounts{}, pumpamm.BuyArgs{}, nil, fmt.Errorf("simulate quote consumed: %w", err)
@@ -574,9 +585,13 @@ func pumpAmmAutofillBuy(ctx context.Context, rpc *sdkrpc.Client, user, pool sola
 	if err != nil {
 		return accts, fmt.Errorf("fetch amm core for pool %s: %w", pool, err)
 	}
-	protocolRecipient := firstNonZeroPK(core.GlobalConfig.ProtocolFeeRecipients[:])
-	if isZeroPK(protocolRecipient) {
-		return accts, fmt.Errorf("protocol fee recipient not found in global_config for pool %s", pool)
+	protocolRecipient, err := pumpAmmFeeRecipient(core.GlobalConfig, core.Pool.IsMayhemMode)
+	if err != nil {
+		return accts, fmt.Errorf("select protocol fee recipient for pool %s: %w", pool, err)
+	}
+	buybackFeeRecipient, err := randomFeeRecipient("buyback fee recipient", core.GlobalConfig.BuybackFeeRecipients[:])
+	if err != nil {
+		return accts, fmt.Errorf("select buyback fee recipient for pool %s: %w", pool, err)
 	}
 
 	userBaseATA, _, err := findATAWithProgram(user, core.Pool.BaseMint, core.BaseTokenProgram, constants.AssociatedTokenProgramID)
@@ -630,6 +645,20 @@ func pumpAmmAutofillBuy(ctx context.Context, rpc *sdkrpc.Client, user, pool sola
 	if pk, _, err := pumpamm.DeriveBuyProtocolFeeRecipientTokenAccountPDA(accts, pumpamm.BuyArgs{}); err == nil {
 		accts.ProtocolFeeRecipientTokenAccount = pk
 	}
+	remainingAccounts, err := pumpAmmRemainingAccounts(
+		core.Pool.BaseMint,
+		core.Pool.QuoteMint,
+		user,
+		core.QuoteTokenProgram,
+		core.Pool.CoinCreator,
+		buybackFeeRecipient,
+		core.Pool.IsCashbackCoin,
+		false,
+	)
+	if err != nil {
+		return accts, err
+	}
+	accts.RemainingAccounts = remainingAccounts
 
 	return accts, nil
 }
@@ -646,9 +675,13 @@ func pumpAmmAutofillSell(ctx context.Context, rpc *sdkrpc.Client, user, pool sol
 	if err != nil {
 		return accts, fmt.Errorf("fetch amm core for pool %s: %w", pool, err)
 	}
-	protocolRecipient := firstNonZeroPK(core.GlobalConfig.ProtocolFeeRecipients[:])
-	if isZeroPK(protocolRecipient) {
-		return accts, fmt.Errorf("protocol fee recipient not found in global_config for pool %s", pool)
+	protocolRecipient, err := pumpAmmFeeRecipient(core.GlobalConfig, core.Pool.IsMayhemMode)
+	if err != nil {
+		return accts, fmt.Errorf("select protocol fee recipient for pool %s: %w", pool, err)
+	}
+	buybackFeeRecipient, err := randomFeeRecipient("buyback fee recipient", core.GlobalConfig.BuybackFeeRecipients[:])
+	if err != nil {
+		return accts, fmt.Errorf("select buyback fee recipient for pool %s: %w", pool, err)
 	}
 
 	userBaseATA, _, err := findATAWithProgram(user, core.Pool.BaseMint, core.BaseTokenProgram, constants.AssociatedTokenProgramID)
@@ -695,6 +728,20 @@ func pumpAmmAutofillSell(ctx context.Context, rpc *sdkrpc.Client, user, pool sol
 			accts.CoinCreatorVaultAta = pk2
 		}
 	}
+	remainingAccounts, err := pumpAmmRemainingAccounts(
+		core.Pool.BaseMint,
+		core.Pool.QuoteMint,
+		user,
+		core.QuoteTokenProgram,
+		core.Pool.CoinCreator,
+		buybackFeeRecipient,
+		core.Pool.IsCashbackCoin,
+		true,
+	)
+	if err != nil {
+		return accts, err
+	}
+	accts.RemainingAccounts = remainingAccounts
 	return accts, nil
 }
 
@@ -715,8 +762,6 @@ type ammCoreResult struct {
 // 同时获取 baseMint 和 quoteMint 的 owner（token program）。
 func fetchAmmCore(ctx context.Context, rpc *sdkrpc.Client, pool, globalConfig solana.PublicKey) (ammCoreResult, error) {
 	var result ammCoreResult
-	result.BaseTokenProgram = constants.TokenProgramID
-	result.QuoteTokenProgram = constants.TokenProgramID
 
 	// 批量查询：pool, global_config
 	amap, err := fetchAccountsBatch(ctx, rpc, pool, globalConfig)
@@ -728,6 +773,9 @@ func fetchAmmCore(ctx context.Context, rpc *sdkrpc.Client, pool, globalConfig so
 	if poolAcc == nil || poolAcc.Data == nil {
 		return result, fmt.Errorf("pool account %s not found (may be invalid pool address or RPC issue)", pool)
 	}
+	if poolAcc.Owner != pumpamm.ProgramKey {
+		return result, fmt.Errorf("pool account %s has unexpected owner %s", pool, poolAcc.Owner)
+	}
 	if err := result.Pool.Unmarshal(poolAcc.Data.GetBinary()); err != nil {
 		return result, fmt.Errorf("decode pool %s: %w", pool, err)
 	}
@@ -735,6 +783,9 @@ func fetchAmmCore(ctx context.Context, rpc *sdkrpc.Client, pool, globalConfig so
 	globalAcc := amap[globalConfig.String()]
 	if globalAcc == nil || globalAcc.Data == nil {
 		return result, fmt.Errorf("global_config account %s not found", globalConfig)
+	}
+	if globalAcc.Owner != pumpamm.ProgramKey {
+		return result, fmt.Errorf("global_config account %s has unexpected owner %s", globalConfig, globalAcc.Owner)
 	}
 	if err := result.GlobalConfig.Unmarshal(globalAcc.Data.GetBinary()); err != nil {
 		return result, fmt.Errorf("decode global_config %s: %w", globalConfig, err)
@@ -746,11 +797,21 @@ func fetchAmmCore(ctx context.Context, rpc *sdkrpc.Client, pool, globalConfig so
 	if err != nil {
 		return result, err
 	}
-	if acc := mintMap[result.Pool.BaseMint.String()]; acc != nil {
-		result.BaseTokenProgram = acc.Owner
+	baseMintAccount := mintMap[result.Pool.BaseMint.String()]
+	if baseMintAccount == nil {
+		return result, fmt.Errorf("base mint account %s not found", result.Pool.BaseMint)
 	}
-	if acc := mintMap[result.Pool.QuoteMint.String()]; acc != nil {
-		result.QuoteTokenProgram = acc.Owner
+	result.BaseTokenProgram = baseMintAccount.Owner
+	if !isSupportedTokenProgram(result.BaseTokenProgram) {
+		return result, fmt.Errorf("base mint %s has unsupported token program %s", result.Pool.BaseMint, result.BaseTokenProgram)
+	}
+	quoteMintAccount := mintMap[result.Pool.QuoteMint.String()]
+	if quoteMintAccount == nil {
+		return result, fmt.Errorf("quote mint account %s not found", result.Pool.QuoteMint)
+	}
+	result.QuoteTokenProgram = quoteMintAccount.Owner
+	if !isSupportedTokenProgram(result.QuoteTokenProgram) {
+		return result, fmt.Errorf("quote mint %s has unsupported token program %s", result.Pool.QuoteMint, result.QuoteTokenProgram)
 	}
 
 	return result, nil
@@ -783,6 +844,7 @@ func toBuyExactAccounts(a pumpamm.BuyAccounts) pumpamm.BuyExactQuoteInAccounts {
 		UserVolumeAccumulator:            a.UserVolumeAccumulator,
 		FeeConfig:                        a.FeeConfig,
 		FeeProgram:                       a.FeeProgram,
+		RemainingAccounts:                a.RemainingAccounts,
 	}
 }
 
@@ -799,21 +861,24 @@ func applySlippage(amount uint64, slippageBps uint64) uint64 {
 
 func fetchTokenAmount(ctx context.Context, rpc *sdkrpc.Client, account solana.PublicKey) (uint64, error) {
 	info, err := rpc.Raw().GetAccountInfo(ctx, account)
+	if errors.Is(err, solanarpc.ErrNotFound) {
+		return 0, nil
+	}
 	if err != nil {
-		// RPC error might indicate account doesn't exist, return 0 instead of error
-		if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "could not find") {
-			return 0, nil
-		}
 		return 0, fmt.Errorf("fetch token account %s: %w", account, err)
 	}
-	if info == nil || info.Value == nil || info.Value.Data == nil {
-		// Account doesn't exist yet, return 0
+	if info == nil || info.Value == nil {
 		return 0, nil
+	}
+	if !isSupportedTokenProgram(info.Value.Owner) {
+		return 0, fmt.Errorf("token account %s has unsupported owner %s", account, info.Value.Owner)
+	}
+	if info.Value.Data == nil {
+		return 0, fmt.Errorf("token account %s has no data", account)
 	}
 	data := info.Value.Data.GetBinary()
 	if len(data) == 0 {
-		// Account exists but empty, return 0
-		return 0, nil
+		return 0, fmt.Errorf("token account %s has empty data", account)
 	}
 	dec := bin.NewBinDecoder(data)
 	var acc token.Account

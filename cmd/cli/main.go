@@ -86,39 +86,41 @@ type runtimeDeps struct {
 }
 
 func newBuilder(cmd *cobra.Command, opts *globalOpts) (*runtimeDeps, error) {
+	if opts == nil {
+		return nil, fmt.Errorf("global options are required")
+	}
+
 	cfg := sdkconfig.DefaultRPCConfig()
-	if opts != nil {
-		if opts.rpcURL != "" {
-			cfg.RPCURL = opts.rpcURL
-		}
-		if opts.commitment != "" {
-			cfg.Commitment = opts.commitment
-		}
-		cfg.RateLimit.RPS = opts.rateLimitRPS
-		cfg.Retry.MaxAttempts = opts.retryAttempts
-		if opts.retryBackoffMs > 0 {
-			cfg.Retry.InitialBackoff = time.Duration(opts.retryBackoffMs) * time.Millisecond
-		}
-		if opts.timeoutSec > 0 {
-			cfg.Timeout = time.Duration(opts.timeoutSec) * time.Second
-		}
+	if opts.rpcURL != "" {
+		cfg.RPCURL = opts.rpcURL
+	}
+	if opts.commitment != "" {
+		cfg.Commitment = opts.commitment
+	}
+	cfg.RateLimit.RPS = opts.rateLimitRPS
+	cfg.Retry.MaxAttempts = opts.retryAttempts
+	if opts.retryBackoffMs > 0 {
+		cfg.Retry.InitialBackoff = time.Duration(opts.retryBackoffMs) * time.Millisecond
+	}
+	if opts.timeoutSec > 0 {
+		cfg.Timeout = time.Duration(opts.timeoutSec) * time.Second
 	}
 	level := parseLogLevel(opts.logLevel)
 	cfg.Logger = zerolog.New(cmd.ErrOrStderr()).Level(level)
 
 	client := sdkrpc.NewClient(cfg)
 	commit := rpc.CommitmentType(cfg.Commitment)
-	builder := txbuilder.NewBuilder(client, commit).WithSkipPreflight(opts != nil && opts.skipPreflight)
+	builder := txbuilder.NewBuilder(client, commit).WithSkipPreflight(opts.skipPreflight)
 
 	var signer wallet.Signer
 	switch {
-	case opts != nil && opts.feePayerPath != "":
+	case opts.feePayerPath != "":
 		local, err := wallet.NewLocalFromKeygen(opts.feePayerPath)
 		if err != nil {
 			return nil, err
 		}
 		signer = local
-	case opts != nil && opts.signerEndpoint != "":
+	case opts.signerEndpoint != "":
 		signer = wallet.NewRemoteSigner(solana.PublicKey{}, func(ctx context.Context, message []byte) ([]byte, error) {
 			return nil, fmt.Errorf("remote signer placeholder: %s", opts.signerEndpoint)
 		})

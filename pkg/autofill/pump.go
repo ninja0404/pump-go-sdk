@@ -155,6 +155,7 @@ func PumpBuyExactSolIn(ctx context.Context, rpc *sdkrpc.Client, user, mint solan
 		UserVolumeAccumulator:   baseAccts.UserVolumeAccumulator,
 		FeeConfig:               baseAccts.FeeConfig,
 		FeeProgram:              baseAccts.FeeProgram,
+		RemainingAccounts:       baseAccts.RemainingAccounts,
 	}
 
 	args := pump.BuyExactSolInArgs{
@@ -452,20 +453,42 @@ func pumpAutofillBuy(ctx context.Context, rpc *sdkrpc.Client, user, mint solana.
 		return accts, err
 	}
 
-	// parse global for fee recipient
+	// Decode protocol state used to select dynamic accounts.
 	globalAcc := amap[accts.Global.String()]
-	if globalAcc != nil && globalAcc.Data != nil {
-		var globalState pump.Global
-		if err := globalState.Unmarshal(globalAcc.Data.GetBinary()); err == nil {
-			feeRecipient := firstNonZeroPK(append(globalState.FeeRecipients[:], globalState.FeeRecipient))
-			if !isZeroPK(feeRecipient) {
-				accts.FeeRecipient = feeRecipient
-			}
-		}
+	if globalAcc == nil || globalAcc.Data == nil {
+		return accts, fmt.Errorf("global account %s not found for mint %s", accts.Global, mint)
 	}
-	if isZeroPK(accts.FeeRecipient) {
-		return accts, fmt.Errorf("fee recipient not found in global config for mint %s", mint)
+	if globalAcc.Owner != pump.ProgramKey {
+		return accts, fmt.Errorf("global account %s has unexpected owner %s", accts.Global, globalAcc.Owner)
 	}
+	var globalState pump.Global
+	if err := globalState.Unmarshal(globalAcc.Data.GetBinary()); err != nil {
+		return accts, fmt.Errorf("decode global %s: %w", accts.Global, err)
+	}
+	bcAcc := amap[accts.BondingCurve.String()]
+	if bcAcc == nil || bcAcc.Data == nil {
+		return accts, fmt.Errorf("bonding_curve account %s not found for mint %s", accts.BondingCurve, mint)
+	}
+	if bcAcc.Owner != pump.ProgramKey {
+		return accts, fmt.Errorf("bonding_curve account %s has unexpected owner %s", accts.BondingCurve, bcAcc.Owner)
+	}
+	var bc pump.BondingCurve
+	if err := bc.Unmarshal(bcAcc.Data.GetBinary()); err != nil {
+		return accts, fmt.Errorf("decode bonding_curve %s: %w", accts.BondingCurve, err)
+	}
+	accts.FeeRecipient, err = pumpFeeRecipient(globalState, bc.IsMayhemMode)
+	if err != nil {
+		return accts, fmt.Errorf("select fee recipient for mint %s: %w", mint, err)
+	}
+	buybackFeeRecipient, err := randomFeeRecipient("buyback fee recipient", globalState.BuybackFeeRecipients[:])
+	if err != nil {
+		return accts, fmt.Errorf("select buyback fee recipient for mint %s: %w", mint, err)
+	}
+	remainingAccounts, err := pumpLegacyRemainingAccounts(mint, user, buybackFeeRecipient, false)
+	if err != nil {
+		return accts, err
+	}
+	accts.RemainingAccounts = remainingAccounts
 
 	// identify token program from mint owner
 	mintAcc := amap[accts.Mint.String()]
@@ -473,6 +496,9 @@ func pumpAutofillBuy(ctx context.Context, rpc *sdkrpc.Client, user, mint solana.
 		return accts, fmt.Errorf("mint account %s not found (may be invalid mint or RPC issue)", mint)
 	}
 	accts.TokenProgram = mintAcc.Owner
+	if !isSupportedTokenProgram(accts.TokenProgram) {
+		return accts, fmt.Errorf("mint %s has unsupported token program %s", mint, accts.TokenProgram)
+	}
 
 	// derive user ATA
 	assocUser, _, err := findATAWithProgram(accts.User, accts.Mint, accts.TokenProgram, constants.AssociatedTokenProgramID)
@@ -488,18 +514,11 @@ func pumpAutofillBuy(ctx context.Context, rpc *sdkrpc.Client, user, mint solana.
 	}
 	accts.AssociatedBondingCurve = assocBC
 
-	// parse bonding_curve for creator vault
-	bcAcc := amap[accts.BondingCurve.String()]
-	if bcAcc == nil || bcAcc.Data == nil {
-		return accts, fmt.Errorf("bonding_curve account %s not found for mint %s", accts.BondingCurve, mint)
+	creatorVault, _, err := solana.FindProgramAddress([][]byte{[]byte(constants.SeedCreatorVault), bc.Creator[:]}, pump.ProgramKey)
+	if err != nil {
+		return accts, fmt.Errorf("derive creator vault: %w", err)
 	}
-	var bc pump.BondingCurve
-	if err := bc.Unmarshal(bcAcc.Data.GetBinary()); err != nil {
-		return accts, fmt.Errorf("decode bonding_curve %s: %w", accts.BondingCurve, err)
-	}
-	if pk, _, err := solana.FindProgramAddress([][]byte{[]byte(constants.SeedCreatorVault), bc.Creator[:]}, pump.ProgramKey); err == nil {
-		accts.CreatorVault = pk
-	}
+	accts.CreatorVault = creatorVault
 
 	return accts, nil
 }
@@ -540,15 +559,38 @@ func pumpAutofillSell(ctx context.Context, rpc *sdkrpc.Client, user, mint solana
 	if globalAcc == nil || globalAcc.Data == nil {
 		return accts, fmt.Errorf("global account %s not found for mint %s", accts.Global, mint)
 	}
+	if globalAcc.Owner != pump.ProgramKey {
+		return accts, fmt.Errorf("global account %s has unexpected owner %s", accts.Global, globalAcc.Owner)
+	}
 	var globalState pump.Global
 	if err := globalState.Unmarshal(globalAcc.Data.GetBinary()); err != nil {
 		return accts, fmt.Errorf("decode global %s: %w", accts.Global, err)
 	}
-	feeRecipient := firstNonZeroPK(append(globalState.FeeRecipients[:], globalState.FeeRecipient))
-	if isZeroPK(feeRecipient) {
-		return accts, fmt.Errorf("fee recipient not found in global config for mint %s", mint)
+	bcAcc := amap[accts.BondingCurve.String()]
+	if bcAcc == nil || bcAcc.Data == nil {
+		return accts, fmt.Errorf("bonding_curve account %s not found for mint %s", accts.BondingCurve, mint)
+	}
+	if bcAcc.Owner != pump.ProgramKey {
+		return accts, fmt.Errorf("bonding_curve account %s has unexpected owner %s", accts.BondingCurve, bcAcc.Owner)
+	}
+	var bc pump.BondingCurve
+	if err := bc.Unmarshal(bcAcc.Data.GetBinary()); err != nil {
+		return accts, fmt.Errorf("decode bonding_curve %s: %w", accts.BondingCurve, err)
+	}
+	feeRecipient, err := pumpFeeRecipient(globalState, bc.IsMayhemMode)
+	if err != nil {
+		return accts, fmt.Errorf("select fee recipient for mint %s: %w", mint, err)
 	}
 	accts.FeeRecipient = feeRecipient
+	buybackFeeRecipient, err := randomFeeRecipient("buyback fee recipient", globalState.BuybackFeeRecipients[:])
+	if err != nil {
+		return accts, fmt.Errorf("select buyback fee recipient for mint %s: %w", mint, err)
+	}
+	remainingAccounts, err := pumpLegacyRemainingAccounts(mint, user, buybackFeeRecipient, bc.IsCashbackCoin)
+	if err != nil {
+		return accts, err
+	}
+	accts.RemainingAccounts = remainingAccounts
 
 	// identify token program from mint owner
 	mintAcc := amap[accts.Mint.String()]
@@ -556,6 +598,9 @@ func pumpAutofillSell(ctx context.Context, rpc *sdkrpc.Client, user, mint solana
 		return accts, fmt.Errorf("mint account %s not found (may be invalid mint or RPC issue)", mint)
 	}
 	accts.TokenProgram = mintAcc.Owner
+	if !isSupportedTokenProgram(accts.TokenProgram) {
+		return accts, fmt.Errorf("mint %s has unsupported token program %s", mint, accts.TokenProgram)
+	}
 
 	// derive user ATA
 	assocUser, _, err := findATAWithProgram(accts.User, accts.Mint, accts.TokenProgram, constants.AssociatedTokenProgramID)
@@ -571,18 +616,11 @@ func pumpAutofillSell(ctx context.Context, rpc *sdkrpc.Client, user, mint solana
 	}
 	accts.AssociatedBondingCurve = assocBC
 
-	// parse bonding_curve for creator vault
-	bcAcc := amap[accts.BondingCurve.String()]
-	if bcAcc == nil || bcAcc.Data == nil {
-		return accts, fmt.Errorf("bonding_curve account %s not found for mint %s", accts.BondingCurve, mint)
+	creatorVault, _, err := solana.FindProgramAddress([][]byte{[]byte(constants.SeedCreatorVault), bc.Creator[:]}, pump.ProgramKey)
+	if err != nil {
+		return accts, fmt.Errorf("derive creator vault: %w", err)
 	}
-	var bc pump.BondingCurve
-	if err := bc.Unmarshal(bcAcc.Data.GetBinary()); err != nil {
-		return accts, fmt.Errorf("decode bonding_curve %s: %w", accts.BondingCurve, err)
-	}
-	if pk, _, err := solana.FindProgramAddress([][]byte{[]byte(constants.SeedCreatorVault), bc.Creator[:]}, pump.ProgramKey); err == nil {
-		accts.CreatorVault = pk
-	}
+	accts.CreatorVault = creatorVault
 
 	return accts, nil
 }
@@ -591,7 +629,7 @@ func applyOverrides(target interface{}, m map[string]solana.PublicKey) {
 	if len(m) == 0 {
 		return
 	}
-	applyPubkeyOverrides(target, m) // ignore error: field mismatch will panic; ensure map keys are valid
+	applyPubkeyOverrides(target, m)
 }
 
 // PumpCreate creates a new SPL Token on Pump.fun bonding curve.
@@ -866,7 +904,7 @@ func PumpCreateV2(ctx context.Context, rpc *sdkrpc.Client, user solana.PublicKey
 	mint := mintKey.PublicKey()
 
 	// Auto-fill accounts
-	accts, err := pumpAutofillCreateV2(ctx, rpc, user, mint)
+	accts, err := pumpAutofillCreateV2(ctx, rpc, user, mint, options.QuoteMint)
 	if err != nil {
 		return pump.CreateV2Accounts{}, pump.CreateV2Args{}, nil, nil, err
 	}
@@ -878,6 +916,9 @@ func PumpCreateV2(ctx context.Context, rpc *sdkrpc.Client, user solana.PublicKey
 		Uri:          uri,
 		Creator:      user,
 		IsMayhemMode: isMayhemMode,
+		IsCashbackEnabled: pump.OptionBool{
+			Field0: options.CashbackEnabled,
+		},
 	}
 
 	ix, err := pump.BuildCreateV2(accts, args)
@@ -923,7 +964,7 @@ func PumpCreateV2WithMint(ctx context.Context, rpc *sdkrpc.Client, user solana.P
 	}
 
 	mint := mintKey.PublicKey()
-	accts, err := pumpAutofillCreateV2(ctx, rpc, user, mint)
+	accts, err := pumpAutofillCreateV2(ctx, rpc, user, mint, options.QuoteMint)
 	if err != nil {
 		return pump.CreateV2Accounts{}, pump.CreateV2Args{}, nil, err
 	}
@@ -935,6 +976,9 @@ func PumpCreateV2WithMint(ctx context.Context, rpc *sdkrpc.Client, user solana.P
 		Uri:          uri,
 		Creator:      user,
 		IsMayhemMode: isMayhemMode,
+		IsCashbackEnabled: pump.OptionBool{
+			Field0: options.CashbackEnabled,
+		},
 	}
 
 	ix, err := pump.BuildCreateV2(accts, args)
@@ -946,7 +990,7 @@ func PumpCreateV2WithMint(ctx context.Context, rpc *sdkrpc.Client, user solana.P
 }
 
 // pumpAutofillCreateV2 auto-fills accounts for create_v2 instruction (Token-2022).
-func pumpAutofillCreateV2(ctx context.Context, rpc *sdkrpc.Client, user, mint solana.PublicKey) (pump.CreateV2Accounts, error) {
+func pumpAutofillCreateV2(ctx context.Context, rpc *sdkrpc.Client, user, mint, quoteMint solana.PublicKey) (pump.CreateV2Accounts, error) {
 	accts := pump.CreateV2Accounts{
 		Mint:                   mint,
 		User:                   user,
@@ -992,10 +1036,12 @@ func pumpAutofillCreateV2(ctx context.Context, rpc *sdkrpc.Client, user, mint so
 		accts.MayhemState = pk
 	}
 
-	// Derive MayhemTokenVault PDA
-	if pk, _, err := pump.DeriveCreateV2MayhemTokenVaultPDA(accts, pump.CreateV2Args{}); err == nil {
-		accts.MayhemTokenVault = pk
+	// Derive the Mayhem Token-2022 vault owned by the SOL vault.
+	mayhemTokenVault, _, err := findATAWithProgram(accts.SolVault, mint, constants.Token2022ProgramID, constants.AssociatedTokenProgramID)
+	if err != nil {
+		return accts, fmt.Errorf("derive mayhem token vault: %w", err)
 	}
+	accts.MayhemTokenVault = mayhemTokenVault
 
 	// Derive AssociatedBondingCurve (ATA using Token-2022)
 	assocBC, _, err := findATAWithProgram(accts.BondingCurve, mint, constants.Token2022ProgramID, constants.AssociatedTokenProgramID)
@@ -1003,6 +1049,35 @@ func pumpAutofillCreateV2(ctx context.Context, rpc *sdkrpc.Client, user, mint so
 		return accts, fmt.Errorf("derive bonding curve ATA: %w", err)
 	}
 	accts.AssociatedBondingCurve = assocBC
+
+	if !quoteMint.IsZero() && quoteMint != constants.WSOLMint {
+		quoteAccounts, err := fetchAccountsBatch(ctx, rpc, quoteMint)
+		if err != nil {
+			return accts, err
+		}
+		quoteMintAccount := quoteAccounts[quoteMint.String()]
+		if quoteMintAccount == nil {
+			return accts, fmt.Errorf("quote mint account %s not found", quoteMint)
+		}
+		quoteTokenProgram := quoteMintAccount.Owner
+		if !isSupportedTokenProgram(quoteTokenProgram) {
+			return accts, fmt.Errorf("quote mint %s has unsupported token program %s", quoteMint, quoteTokenProgram)
+		}
+		associatedQuoteBondingCurve, _, err := findATAWithProgram(
+			accts.BondingCurve,
+			quoteMint,
+			quoteTokenProgram,
+			constants.AssociatedTokenProgramID,
+		)
+		if err != nil {
+			return accts, fmt.Errorf("derive quote bonding curve ATA: %w", err)
+		}
+		accts.RemainingAccounts = []*solana.AccountMeta{
+			solana.NewAccountMeta(quoteMint, false, false),
+			solana.NewAccountMeta(associatedQuoteBondingCurve, true, false),
+			solana.NewAccountMeta(quoteTokenProgram, false, false),
+		}
+	}
 
 	return accts, nil
 }
